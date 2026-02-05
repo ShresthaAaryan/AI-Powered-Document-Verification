@@ -1,0 +1,49 @@
+# Build artifacts
+bin/
+obj/
+
+# User / runtime uploads
+uploads/
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+.idea/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet packages
+packages/
+*.nupkg
+*.snupkg
+
+# Test results
+TestResult*/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# Resharper / Rider
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# NCrunch
+*.ncrunch*
+_NCrunch_*/
+
+# Others / tooling
+.ionide/
+.fake/
+
+# OS / system files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

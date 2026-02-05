@@ -1,0 +1,69 @@
+# General OS / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.stackdump
+
+# Node / frontend
+node_modules/
+.next/
+dist/
+out/
+.turbo/
+.cache/
+.eslintcache
+*.tsbuildinfo
+
+# .NET / backend
+bin/
+obj/
+packages/
+
+# Logs
+logs/
+*.log
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Tooling / IDE specific
+.vs/
+.vscode/
+.idea/
+.ionide/
+.fake/
+**/.vs/
+**/.vscode/
+**/.idea/
+
+# Coverage / test outputs
+coverage/
+.nyc_output/
+TestResults/
+TestResult*/
+*.trx
+*.coverage
+*.coveragexml
+
+# IDE / tool databases and indexes
+*.db
+*.sqlite
+*.vsidx
+*.bin
+
+# App-specific runtime data
+uploads/
+
+# Large ML models (keep out of git)
+Backend/Models/*.onnx
+Backend/Models/*.pt
+Backend/Models/*.bin
