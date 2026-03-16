@@ -397,7 +397,7 @@ export default function VerificationStatus() {
                     )}
                   </div>
                 )}
-                {verification.ocrResult && (
+                {/* {verification.ocrResult && (
                   <div>
                     <dt className="text-sm font-medium text-gray-500 mb-1">OCR Confidence</dt>
                     <dd className="flex items-center justify-between">
@@ -411,7 +411,7 @@ export default function VerificationStatus() {
                       )}
                     </dd>
                   </div>
-                )}
+                )} */}
               </dl>
             </div>
           )}

@@ -13,7 +13,7 @@ public class AIModelsHealthCheck : IHealthCheck
         _configuration = configuration;
     }
 
-    public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
+    public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
     {
         try
         {
@@ -49,20 +49,20 @@ public class AIModelsHealthCheck : IHealthCheck
 
             if (issues.Count == 0)
             {
-                return HealthCheckResult.Healthy("All AI models and resources are available");
+                return Task.FromResult(HealthCheckResult.Healthy("All AI models and resources are available"));
             }
 
-            return HealthCheckResult.Degraded(
+            return Task.FromResult(HealthCheckResult.Degraded(
                 description: "Some AI resources are unavailable",
                 data: new Dictionary<string, object>
                 {
                     ["issues"] = string.Join(", ", issues)
-                });
+                }));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during AI models health check");
-            return HealthCheckResult.Unhealthy("AI models health check failed", ex);
+            return Task.FromResult(HealthCheckResult.Unhealthy("AI models health check failed", ex));
         }
     }
 }

@@ -205,7 +205,7 @@ public class AuthService : IAuthService
         }
     }
 
-    public async Task<bool> ValidateTokenAsync(string token)
+    public Task<bool> ValidateTokenAsync(string token)
     {
         try
         {
@@ -225,11 +225,11 @@ public class AuthService : IAuthService
             };
 
             tokenHandler.ValidateToken(token, validationParameters, out SecurityToken validatedToken);
-            return true;
+            return Task.FromResult(true);
         }
         catch
         {
-            return false;
+            return Task.FromResult(false);
         }
     }
 

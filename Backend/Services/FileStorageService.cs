@@ -62,7 +62,7 @@ public class FileStorageService : IFileStorageService
         }
     }
 
-    public async Task<bool> DeleteFileAsync(string filePath)
+    public Task<bool> DeleteFileAsync(string filePath)
     {
         try
         {
@@ -70,14 +70,14 @@ public class FileStorageService : IFileStorageService
             {
                 System.IO.File.Delete(filePath);
                 _logger.LogInformation("File deleted successfully: {FilePath}", filePath);
-                return true;
+                return Task.FromResult(true);
             }
-            return false;
+            return Task.FromResult(false);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error deleting file: {FilePath}", filePath);
-            return false;
+            return Task.FromResult(false);
         }
     }
 

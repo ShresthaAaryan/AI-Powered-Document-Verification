@@ -19,6 +19,7 @@ public class FaceMatchingService : IFaceMatchingService
     private readonly InferenceSession? _faceRecognitionSession;
     private readonly float _similarityThreshold;
     private readonly float _highConfidenceThreshold;
+    private const string FaceModelInputName = "data";
 
     public FaceMatchingService(
         DocumentVerificationDbContext context,
@@ -71,17 +72,20 @@ public class FaceMatchingService : IFaceMatchingService
                 return CreateFailedResult(verificationId, idFaceDetected, selfieFaceDetected, stopwatch.ElapsedMilliseconds, "FaceNotDetected");
             }
 
-            // Generate face embeddings
-            var idEmbedding = await GenerateFaceEmbeddingAsync(idDocumentPath);
-            var selfieEmbedding = await GenerateFaceEmbeddingAsync(selfiePath);
+            // Compare using multiple candidate crops and take the best similarity.
+            // This improves reliability when the ID portrait is small (or surrounded by text) and when selfies are soft/blurred.
+            var colorBest = await CompareWithCandidatesAsync(idDocumentPath, selfiePath, useGrayscale: false);
+            var grayBest = await CompareWithCandidatesAsync(idDocumentPath, selfiePath, useGrayscale: true);
 
-            if (idEmbedding == null || selfieEmbedding == null)
+            if (colorBest.idEmbedding == null || colorBest.selfieEmbedding == null)
             {
                 return CreateFailedResult(verificationId, idFaceDetected, selfieFaceDetected, stopwatch.ElapsedMilliseconds, "EmbeddingGenerationFailed");
             }
 
-            // Calculate similarity score
-            var similarityScore = await CalculateSimilarityScore(idEmbedding, selfieEmbedding);
+            var useGray = grayBest.similarity > colorBest.similarity;
+            var similarityScore = useGray ? grayBest.similarity : colorBest.similarity;
+            var idEmbedding = useGray ? grayBest.idEmbedding : colorBest.idEmbedding;
+            var selfieEmbedding = useGray ? grayBest.selfieEmbedding : colorBest.selfieEmbedding;
 
             // Determine match decision
             var matchDecision = DetermineMatch(similarityScore);
@@ -139,7 +143,12 @@ public class FaceMatchingService : IFaceMatchingService
         }
     }
 
-    public async Task<float[]?> GenerateFaceEmbeddingAsync(string imagePath)
+    public Task<float[]?> GenerateFaceEmbeddingAsync(string imagePath)
+    {
+        return GenerateFaceEmbeddingAsync(imagePath, useGrayscale: false);
+    }
+
+    public async Task<float[]?> GenerateFaceEmbeddingAsync(string imagePath, bool useGrayscale = false)
     {
         try
         {
@@ -151,6 +160,14 @@ public class FaceMatchingService : IFaceMatchingService
 
             // Load and preprocess image; crop to detected face if available
             using var image = await Image.LoadAsync<Rgb24>(imagePath);
+            if (useGrayscale)
+            {
+                ConvertToGrayscaleInPlace(image);
+            }
+
+            // Enhance image quality for better face recognition (soft ID photos, uneven lighting, low contrast)
+            EnhanceImageForFaceRecognition(image);
+
             Rectangle? faceBox = null;
             var (detected, box) = await DetectFaceBoundingBoxAsync(imagePath);
             if (detected && box.HasValue)
@@ -164,7 +181,7 @@ public class FaceMatchingService : IFaceMatchingService
             var inputTensor = new DenseTensor<float>(processedImage, new[] { 1, 3, 112, 112 });
             var inputs = new List<NamedOnnxValue>
             {
-                NamedOnnxValue.CreateFromTensor("data", inputTensor)
+                NamedOnnxValue.CreateFromTensor(FaceModelInputName, inputTensor)
             };
 
             // Run inference
@@ -179,6 +196,151 @@ public class FaceMatchingService : IFaceMatchingService
             _logger.LogError(ex, "Error generating face embedding for: {ImagePath}", imagePath);
             return null;
         }
+    }
+
+    private async Task<(float similarity, float[]? idEmbedding, float[]? selfieEmbedding)> CompareWithCandidatesAsync(
+        string idDocumentPath,
+        string selfiePath,
+        bool useGrayscale)
+    {
+        var idEmbeddings = await GenerateCandidateEmbeddingsAsync(idDocumentPath, useGrayscale);
+        var selfieEmbeddings = await GenerateCandidateEmbeddingsAsync(selfiePath, useGrayscale);
+
+        if (idEmbeddings.Count == 0 || selfieEmbeddings.Count == 0)
+        {
+            // Fallback to existing single-embedding path (keeps behavior for edge cases).
+            var idOne = await GenerateFaceEmbeddingAsync(idDocumentPath, useGrayscale);
+            var selfieOne = await GenerateFaceEmbeddingAsync(selfiePath, useGrayscale);
+            if (idOne == null || selfieOne == null) return (0f, null, null);
+            var sim = await CalculateSimilarityScore(idOne, selfieOne);
+            return (sim, idOne, selfieOne);
+        }
+
+        float best = 0f;
+        float[]? bestId = null;
+        float[]? bestSelfie = null;
+
+        // Evaluate a small cartesian product of candidate crops.
+        foreach (var idEmb in idEmbeddings)
+        {
+            foreach (var sEmb in selfieEmbeddings)
+            {
+                var sim = await CalculateSimilarityScore(idEmb, sEmb);
+                if (sim > best)
+                {
+                    best = sim;
+                    bestId = idEmb;
+                    bestSelfie = sEmb;
+                }
+            }
+        }
+
+        return (best, bestId, bestSelfie);
+    }
+
+    private async Task<List<float[]>> GenerateCandidateEmbeddingsAsync(string imagePath, bool useGrayscale)
+    {
+        var results = new List<float[]>();
+
+        if (_faceRecognitionSession == null) return results;
+
+        try
+        {
+            using var image = await Image.LoadAsync<Rgb24>(imagePath);
+
+            if (useGrayscale)
+            {
+                ConvertToGrayscaleInPlace(image);
+            }
+
+            EnhanceImageForFaceRecognition(image);
+
+            // Detect a face box on the original path (keeps existing logic consistent).
+            var (_, faceBox) = await DetectFaceBoundingBoxAsync(imagePath);
+            var candidateBoxes = GetCandidateFaceBoxes(image.Width, image.Height, faceBox);
+
+            // Limit compute: at most 3 candidates per image.
+            foreach (var box in candidateBoxes.Take(3))
+            {
+                using var clone = image.Clone();
+                var processed = PreprocessFaceImage(clone, box);
+                var embedding = RunFaceModel(processed);
+                if (embedding != null)
+                {
+                    results.Add(embedding);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed generating candidate embeddings for {ImagePath}", imagePath);
+        }
+
+        return results;
+    }
+
+    private float[]? RunFaceModel(float[] processedImage)
+    {
+        try
+        {
+            if (_faceRecognitionSession == null) return null;
+
+            var inputTensor = new DenseTensor<float>(processedImage, new[] { 1, 3, 112, 112 });
+            var inputs = new List<NamedOnnxValue>
+            {
+                NamedOnnxValue.CreateFromTensor(FaceModelInputName, inputTensor)
+            };
+
+            using var results = _faceRecognitionSession.Run(inputs);
+            var embedding = results.First().AsEnumerable<float>().ToArray();
+            return NormalizeEmbedding(embedding);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Face model inference failed");
+            return null;
+        }
+    }
+
+    private static List<Rectangle?> GetCandidateFaceBoxes(int imageWidth, int imageHeight, Rectangle? detected)
+    {
+        var list = new List<Rectangle?>();
+
+        if (detected.HasValue)
+        {
+            // Base box + a slightly expanded version to tolerate detection errors.
+            var b = detected.Value;
+            list.Add(b);
+
+            var expandX = (int)(b.Width * 0.18);
+            var expandY = (int)(b.Height * 0.18);
+            var rx = Math.Clamp(b.X - expandX, 0, imageWidth - 1);
+            var ry = Math.Clamp(b.Y - expandY, 0, imageHeight - 1);
+            var rw = Math.Clamp(b.Width + 2 * expandX, 10, imageWidth - rx);
+            var rh = Math.Clamp(b.Height + 2 * expandY, 10, imageHeight - ry);
+            list.Add(new Rectangle(rx, ry, rw, rh));
+        }
+
+        // Always add a center crop fallback (null means: rely on ResizeMode.Crop center).
+        list.Add(null);
+
+        // Document-style images often have the portrait on the left side.
+        if (imageWidth > imageHeight * 1.2)
+        {
+            var w = (int)(imageWidth * 0.5);
+            var h = (int)(imageHeight * 0.7);
+            list.Add(new Rectangle(0, 0, Math.Clamp(w, 10, imageWidth), Math.Clamp(h, 10, imageHeight)));
+        }
+
+        // Deduplicate rectangles (by value) while preserving order.
+        var seen = new HashSet<string>();
+        var deduped = new List<Rectangle?>();
+        foreach (var r in list)
+        {
+            var key = r.HasValue ? $"{r.Value.X},{r.Value.Y},{r.Value.Width},{r.Value.Height}" : "null";
+            if (seen.Add(key)) deduped.Add(r);
+        }
+        return deduped;
     }
 
     public async Task<float> CalculateSimilarityScore(float[] embedding1, float[] embedding2)
@@ -316,6 +478,63 @@ public class FaceMatchingService : IFaceMatchingService
         }
     }
 
+    /// <summary>
+    /// Enhances image quality for face recognition: sharpens soft/blurry photos (e.g. ID documents),
+    /// improves contrast for flat lighting, and normalizes brightness for uneven lighting.
+    /// </summary>
+    private static void EnhanceImageForFaceRecognition(Image<Rgb24> image)
+    {
+        // Normalize brightness first (estimate before any changes)
+        var brightness = EstimateBrightnessForEnhancement(image);
+        image.Mutate(ctx =>
+        {
+            // Improve contrast so facial features and contours are more distinct (helps soft/flat ID photos)
+            ctx.Contrast(1.2f);
+            // Normalize brightness: boost if too dark, reduce if too bright (helps uneven passport lighting)
+            if (brightness < 0.4f)
+                ctx.Brightness(1.15f);
+            else if (brightness > 0.65f)
+                ctx.Brightness(0.92f);
+            // Sharpen to recover detail in low-resolution or slightly blurry ID/selfie images
+            ctx.GaussianSharpen(1.5f);
+        });
+    }
+
+    private static float EstimateBrightnessForEnhancement(Image<Rgb24> image)
+    {
+        long sum = 0;
+        int count = 0;
+        int stepX = Math.Max(1, image.Width / 80);
+        int stepY = Math.Max(1, image.Height / 80);
+        for (int y = 0; y < image.Height; y += stepY)
+        {
+            for (int x = 0; x < image.Width; x += stepX)
+            {
+                var p = image[x, y];
+                sum += (p.R + p.G + p.B) / 3;
+                count++;
+            }
+        }
+        return count == 0 ? 0.5f : (sum / (float)count / 255f);
+    }
+
+    /// <summary>
+    /// Converts an RGB image to grayscale in place (R=G=B = luminance) for more consistent face comparison
+    /// when ID photos are B&amp;W or lighting differs between ID and selfie.
+    /// </summary>
+    private static void ConvertToGrayscaleInPlace(Image<Rgb24> image)
+    {
+        for (int y = 0; y < image.Height; y++)
+        {
+            for (int x = 0; x < image.Width; x++)
+            {
+                var p = image[x, y];
+                byte gray = (byte)Math.Clamp(0.299 * p.R + 0.587 * p.G + 0.114 * p.B, 0, 255);
+                image[x, y] = new Rgb24(gray, gray, gray);
+            }
+        }
+    }
+
     private float[] NormalizeEmbedding(float[] embedding)
     {
         // Calculate L2 norm
@@ -355,78 +574,179 @@ public class FaceMatchingService : IFaceMatchingService
                 image.Mutate(x => x.Resize((int)(image.Width * scale), (int)(image.Height * scale)));
             }
 
-            // Skin-tone heuristic (simple RGB rules)
+            // Build a skin mask and pick the best connected component (instead of taking min/max over all skin pixels).
+            // This prevents text/background from polluting the crop on ID documents.
             var mask = new bool[image.Width * image.Height];
             int idx = 0;
             for (int y = 0; y < image.Height; y++)
             {
                 for (int x = 0; x < image.Width; x++)
                 {
-                    var p = image[x, y];
-                    var r = p.R; var g = p.G; var b = p.B;
-                    var max = Math.Max(r, Math.Max(g, b));
-                    var min = Math.Min(r, Math.Min(g, b));
-
-                    bool skin = r > 95 && g > 40 && b > 20 &&
-                                (max - min) > 15 &&
-                                Math.Abs(r - g) > 15 &&
-                                r > g && r > b;
-                    mask[idx++] = skin;
+                    mask[idx++] = IsSkinLikely(image[x, y]);
                 }
             }
 
-            // Find bounding box of skin pixels
-            int minX = image.Width, minY = image.Height, maxX = -1, maxY = -1, skinCount = 0;
-            idx = 0;
-            for (int y = 0; y < image.Height; y++)
+            var best = FindBestConnectedSkinComponent(mask, image.Width, image.Height);
+            if (!best.HasValue)
             {
-                for (int x = 0; x < image.Width; x++, idx++)
+                // Fallback: return a reasonable center-ish box; candidates logic will also try left-side crop for wide images.
+                var fw = (int)(image.Width * 0.45);
+                var fh = (int)(image.Height * 0.55);
+                var fx = Math.Clamp((image.Width - fw) / 2, 0, Math.Max(0, image.Width - fw));
+                var fy = Math.Clamp((image.Height - fh) / 4, 0, Math.Max(0, image.Height - fh));
+                var fallback = new Rectangle(fx, fy, Math.Clamp(fw, 10, image.Width), Math.Clamp(fh, 10, image.Height));
+
+                if (Math.Abs(scale - 1.0) > 0.0001)
                 {
-                    if (!mask[idx]) continue;
-                    skinCount++;
-                    if (x < minX) minX = x;
-                    if (x > maxX) maxX = x;
-                    if (y < minY) minY = y;
-                    if (y > maxY) maxY = y;
+                    fallback = new Rectangle((int)(fallback.X / scale), (int)(fallback.Y / scale), (int)(fallback.Width / scale), (int)(fallback.Height / scale));
                 }
+                return (true, fallback);
             }
 
-            if (skinCount == 0 || maxX <= minX || maxY <= minY)
-            {
-                return (false, null);
-            }
-
-            var w = maxX - minX + 1;
-            var h = maxY - minY + 1;
-            var area = w * h;
-            var imgArea = image.Width * image.Height;
-
-            // Heuristic checks: area and aspect ratio
-            var aspect = w / (double)h;
-            if (area < imgArea * 0.02) // too small
-                return (false, null);
-            if (aspect < 0.5 || aspect > 1.8)
-                return (false, null);
+            var rectScaled = best.Value;
 
             // Convert back to original scale if we resized
             if (Math.Abs(scale - 1.0) > 0.0001)
             {
-                minX = (int)(minX / scale);
-                maxX = (int)(maxX / scale);
-                minY = (int)(minY / scale);
-                maxY = (int)(maxY / scale);
-                w = maxX - minX + 1;
-                h = maxY - minY + 1;
+                rectScaled = new Rectangle(
+                    (int)(rectScaled.X / scale),
+                    (int)(rectScaled.Y / scale),
+                    (int)(rectScaled.Width / scale),
+                    (int)(rectScaled.Height / scale));
             }
 
-            var rect = new Rectangle(minX, minY, w, h);
-            return (true, rect);
+            // Final sanity clamp
+            rectScaled = ClampRect(rectScaled, (int)(image.Width / scale), (int)(image.Height / scale));
+            return (true, rectScaled);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Heuristic face box detection failed");
             return (false, null);
         }
+    }
+
+    private static Rectangle ClampRect(Rectangle r, int w, int h)
+    {
+        var x = Math.Clamp(r.X, 0, Math.Max(0, w - 1));
+        var y = Math.Clamp(r.Y, 0, Math.Max(0, h - 1));
+        var rw = Math.Clamp(r.Width, 10, Math.Max(10, w - x));
+        var rh = Math.Clamp(r.Height, 10, Math.Max(10, h - y));
+        return new Rectangle(x, y, rw, rh);
+    }
+
+    // Combined RGB + YCbCr-ish heuristic (more tolerant to lighting than the old RGB-only rule).
+    private static bool IsSkinLikely(Rgb24 p)
+    {
+        var r = (int)p.R;
+        var g = (int)p.G;
+        var b = (int)p.B;
+
+        var max = Math.Max(r, Math.Max(g, b));
+        var min = Math.Min(r, Math.Min(g, b));
+
+        // Classic RGB rule (kept, but slightly relaxed).
+        bool rgbSkin = r > 75 && g > 30 && b > 15 &&
+                       (max - min) > 10 &&
+                       (r - g) > 10 &&
+                       r > g && r > b;
+
+        // Approximate YCbCr constraints.
+        // Y  = 0.299R + 0.587G + 0.114B
+        // Cb = 128 - 0.168736R - 0.331264G + 0.5B
+        // Cr = 128 + 0.5R - 0.418688G - 0.081312B
+        double cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+        double cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+        bool yccSkin = cb is >= 77 and <= 127 && cr is >= 133 and <= 173;
+
+        return rgbSkin || yccSkin;
+    }
+
+    private static Rectangle? FindBestConnectedSkinComponent(bool[] mask, int width, int height)
+    {
+        var visited = new bool[mask.Length];
+
+        Rectangle? bestRect = null;
+        int bestArea = 0;
+        double bestScore = 0;
+
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int i = y * width + x;
+                if (visited[i] || !mask[i]) continue;
+
+                // Flood fill (4-neighborhood)
+                int minX = x, minY = y, maxX = x, maxY = y;
+                int count = 0;
+
+                var q = new Queue<int>();
+                q.Enqueue(i);
+                visited[i] = true;
+
+                while (q.Count > 0)
+                {
+                    int cur = q.Dequeue();
+                    int cy = cur / width;
+                    int cx = cur - cy * width;
+
+                    count++;
+                    if (cx < minX) minX = cx;
+                    if (cx > maxX) maxX = cx;
+                    if (cy < minY) minY = cy;
+                    if (cy > maxY) maxY = cy;
+
+                    // neighbors
+                    void Try(int nx, int ny)
+                    {
+                        if ((uint)nx >= (uint)width || (uint)ny >= (uint)height) return;
+                        int ni = ny * width + nx;
+                        if (visited[ni] || !mask[ni]) return;
+                        visited[ni] = true;
+                        q.Enqueue(ni);
+                    }
+
+                    Try(cx - 1, cy);
+                    Try(cx + 1, cy);
+                    Try(cx, cy - 1);
+                    Try(cx, cy + 1);
+                }
+
+                if (count < (width * height) * 0.01) continue; // too small to be a face region
+
+                int rw = (maxX - minX + 1);
+                int rh = (maxY - minY + 1);
+                int rectArea = rw * rh;
+                if (rectArea <= 0) continue;
+
+                double aspect = rw / (double)rh;
+                if (aspect < 0.45 || aspect > 1.9) continue;
+
+                double fill = count / (double)rectArea; // how dense the component is in its bounding box
+                if (fill < 0.12) continue;
+
+                // Prefer components in upper/middle portion (common for faces in docs/selfies),
+                // prefer larger, denser components.
+                double centerY = (minY + maxY) / 2.0 / height;
+                double yBonus = centerY < 0.75 ? 1.0 : 0.85;
+                double score = rectArea * fill * yBonus;
+
+                if (score > bestScore || (score == bestScore && rectArea > bestArea))
+                {
+                    bestScore = score;
+                    bestArea = rectArea;
+                    bestRect = new Rectangle(minX, minY, rw, rh);
+                }
+            }
+        }
+
+        if (!bestRect.HasValue) return null;
+
+        // Reject if the best component is still too tiny vs full image.
+        if (bestArea < (width * height) * 0.02) return null;
+
+        return bestRect.Value;
     }
 
     private bool DetermineMatch(float similarityScore)

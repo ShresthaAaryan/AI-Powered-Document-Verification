@@ -153,8 +153,10 @@ public class OcrService : IOcrService
                     "Then either set the Tesseract:DataPath in appsettings.json or place tessdata in the application directory.");
             }
 
+            var ocrLanguage = GetOcrLanguageForDocument(documentType);
+
             // Validate language files exist
-            var languages = _tesseractLanguage.Split('+');
+            var languages = ocrLanguage.Split('+');
             var missingLanguages = new List<string>();
             
             foreach (var lang in languages)
@@ -171,7 +173,7 @@ public class OcrService : IOcrService
                 throw new InvalidOperationException(
                     $"Language data file(s) not found in {_tesseractDataPath}: {string.Join(", ", missingLanguages)}. " +
                     $"Please download the required language data file(s) from https://github.com/tesseract-ocr/tessdata " +
-                    $"and place them in the tessdata directory. Configured language: {_tesseractLanguage}");
+                    $"and place them in the tessdata directory. Configured language: {ocrLanguage}");
             }
 
             // Validate image file exists
@@ -185,17 +187,17 @@ public class OcrService : IOcrService
             TesseractEngine engine;
             try
             {
-                engine = new TesseractEngine(_tesseractDataPath, _tesseractLanguage, EngineMode.Default);
-                _logger.LogInformation("Tesseract engine initialized with language: {Language}", _tesseractLanguage);
+                engine = new TesseractEngine(_tesseractDataPath, ocrLanguage, EngineMode.Default);
+                _logger.LogInformation("Tesseract engine initialized with language: {Language}", ocrLanguage);
             }
             catch (Tesseract.TesseractException ex)
             {
                 _logger.LogError(ex, "Failed to initialize Tesseract engine with data path: {TesseractDataPath}, Language: {Language}", 
-                    _tesseractDataPath, _tesseractLanguage);
+                    _tesseractDataPath, ocrLanguage);
                 throw new InvalidOperationException(
                     $"Failed to initialize Tesseract OCR engine. " +
                     $"Data path: {_tesseractDataPath}. " +
-                    $"Language: {_tesseractLanguage}. " +
+                    $"Language: {ocrLanguage}. " +
                     $"Error: {ex.Message}. " +
                     "Please ensure Tesseract is properly installed and the tessdata directory contains the required language files.",
                     ex);
@@ -203,11 +205,17 @@ public class OcrService : IOcrService
 
             using (engine)
             {
-                // Configure Tesseract for better passport OCR
-                // PSM 6 = Uniform block of text (good for structured documents like passports)
-                // PSM 11 = Sparse text (good for MRZ lines)
+                // Configure Tesseract for structured documents.
+                // PSM 6 = Uniform block of text (good default for ID documents)
                 engine.SetVariable("tessedit_pageseg_mode", "6");
-                engine.SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789< ");
+                engine.SetVariable("preserve_interword_spaces", "1");
+                engine.SetVariable("user_defined_dpi", "300");
+
+                // Only apply MRZ-style whitelist for passports; it harms non-Latin scripts and normal prose.
+                if (string.Equals(documentType, "passport", StringComparison.OrdinalIgnoreCase))
+                {
+                    engine.SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789< ");
+                }
                 
                 // Preprocess image for better OCR accuracy
                 var preprocessedImagePath = await PreprocessImageForOcrAsync(imagePath, documentType);
@@ -240,6 +248,18 @@ public class OcrService : IOcrService
                         {
                             rawText = mrzText + "\n" + rawText;
                             confidence = Math.Max(confidence, 85); // MRZ usually has high confidence
+                        }
+                    }
+
+                    // Citizenship certificates often have a dense English "details" box (esp. back side).
+                    // A targeted OCR pass over that region improves field extraction reliability.
+                    if (documentType.Equals("citizenship", StringComparison.OrdinalIgnoreCase) ||
+                        documentType.Equals("citizenshipcard", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var detailsText = await ExtractCitizenshipDetailsTextAsync(imagePath);
+                        if (!string.IsNullOrWhiteSpace(detailsText))
+                        {
+                            rawText = detailsText + "\n" + rawText;
                         }
                     }
 
@@ -276,13 +296,24 @@ public class OcrService : IOcrService
                             BoundingBox = portraitBox
                         };
                     }
+
+                    // Citizenship: check for typical logos/stamps (best-effort heuristics).
+                    if (documentType.Equals("citizenship", StringComparison.OrdinalIgnoreCase) ||
+                        documentType.Equals("citizenshipcard", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var markFields = await DetectCitizenshipMarksAsync(imagePath);
+                        foreach (var kvp in markFields)
+                        {
+                            extractedFields[kvp.Key] = kvp.Value;
+                        }
+                    }
                 
                     // Log extracted fields for debugging
                     _logger.LogInformation("Extracted {FieldCount} fields from OCR: {FieldNames}", 
                         extractedFields.Count, string.Join(", ", extractedFields.Keys));
 
                     // Detect primary language from configured languages
-                    var primaryLanguage = _tesseractLanguage.Split('+').First().Trim();
+                    var primaryLanguage = ocrLanguage.Split('+').First().Trim();
 
                     var ocrResult = new OcrResult
                     {
@@ -335,6 +366,139 @@ public class OcrService : IOcrService
         }
     }
 
+    private string GetOcrLanguageForDocument(string documentType)
+    {
+        // Default to configured language.
+        var lang = _tesseractLanguage;
+
+        // Nepal citizenship: front is largely Nepali; back is English + Nepali.
+        // If nep.traineddata exists, prefer eng+nep (keeps English details readable too).
+        if (documentType.Equals("citizenship", StringComparison.OrdinalIgnoreCase) ||
+            documentType.Equals("citizenshipcard", StringComparison.OrdinalIgnoreCase))
+        {
+            var nep = Path.Combine(_tesseractDataPath, "nep.traineddata");
+            var eng = Path.Combine(_tesseractDataPath, "eng.traineddata");
+            if (File.Exists(nep) && File.Exists(eng))
+            {
+                lang = "eng+nep";
+            }
+            else if (File.Exists(nep))
+            {
+                lang = "nep";
+            }
+        }
+
+        return lang;
+    }
+
+    private async Task<Dictionary<string, ExtractedFieldDto>> DetectCitizenshipMarksAsync(string imagePath)
+    {
+        var fields = new Dictionary<string, ExtractedFieldDto>();
+
+        try
+        {
+            using var image = await Image.LoadAsync<Rgb24>(imagePath);
+
+            // Regions tuned to typical Nepal citizenship scans:
+            // - National emblem/logo: top-left
+            // - Top-right emblem/stamp/logo mark (often blue)
+            var emblemRegion = new Rectangle(0, 0, (int)(image.Width * 0.22), (int)(image.Height * 0.18));
+            var stampRegion = new Rectangle((int)(image.Width * 0.72), 0, (int)(image.Width * 0.28), (int)(image.Height * 0.25));
+
+            var (emblemScore, stampScore, redInkScore) = MeasureColorSignals(image, emblemRegion, stampRegion);
+
+            // Explicit top-right check (what you asked for on the front side).
+            fields["hasTopRightEmblemStamp"] = new ExtractedFieldDto
+            {
+                Value = (stampScore > 0.010f).ToString(),
+                Confidence = (decimal)Math.Clamp(stampScore * 35f, 0.50f, 0.95f),
+                BoundingBox = new BoundingBoxDto { X = stampRegion.X, Y = stampRegion.Y, Width = stampRegion.Width, Height = stampRegion.Height }
+            };
+
+            // Red ink signature/stamp marks are common (e.g., red pen strokes).
+            fields["hasRedInkMark"] = new ExtractedFieldDto
+            {
+                Value = (redInkScore > 0.0025f).ToString(),
+                Confidence = (decimal)Math.Clamp(redInkScore * 80f, 0.50f, 0.95f),
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = image.Width, Height = image.Height }
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Citizenship stamp/logo detection failed");
+        }
+
+        return fields;
+    }
+
+    private static (float emblemRedRatio, float stampBlueRatio, float globalRedRatio) MeasureColorSignals(
+        Image<Rgb24> image,
+        Rectangle emblemRegion,
+        Rectangle stampRegion)
+    {
+        static float Saturation(byte r, byte g, byte b)
+        {
+            var max = Math.Max(r, Math.Max(g, b));
+            var min = Math.Min(r, Math.Min(g, b));
+            return max == 0 ? 0f : (max - min) / (float)max;
+        }
+
+        float CountRed(Rectangle r)
+        {
+            r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+            if (r.Width <= 0 || r.Height <= 0) return 0f;
+
+            long red = 0;
+            long total = 0;
+            var step = Math.Max(1, Math.Min(r.Width, r.Height) / 220);
+            for (var y = r.Y; y < r.Y + r.Height; y += step)
+            {
+                for (var x = r.X; x < r.X + r.Width; x += step)
+                {
+                    var p = image[x, y];
+                    var sat = Saturation(p.R, p.G, p.B);
+                    // Red-ish pixel (tolerant to faded/pink emblem on yellow security paper).
+                    if (sat > 0.22f && p.R >= p.G + 18 && p.R >= p.B + 18)
+                        red++;
+                    total++;
+                }
+            }
+            return total > 0 ? (float)red / total : 0f;
+        }
+
+        float CountBlue(Rectangle r)
+        {
+            r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+            if (r.Width <= 0 || r.Height <= 0) return 0f;
+
+            long blue = 0;
+            long total = 0;
+            var step = Math.Max(1, Math.Min(r.Width, r.Height) / 220);
+            for (var y = r.Y; y < r.Y + r.Height; y += step)
+            {
+                for (var x = r.X; x < r.X + r.Width; x += step)
+                {
+                    var p = image[x, y];
+                    var sat = Saturation(p.R, p.G, p.B);
+                    // Blue-ish pixel (tolerant to light stamp ink).
+                    if (sat > 0.18f && p.B >= p.R + 12 && p.B >= p.G + 10)
+                        blue++;
+                    total++;
+                }
+            }
+            return total > 0 ? (float)blue / total : 0f;
+        }
+
+        var emblemRed = CountRed(emblemRegion);
+        var stampBlue = CountBlue(stampRegion);
+
+        // Scan whole image (sampled) for red ink marks.
+        var global = new Rectangle(0, 0, image.Width, image.Height);
+        var globalRed = CountRed(global);
+
+        return (emblemRed, stampBlue, globalRed);
+    }
+
     public async Task<OcrResultDto> ProcessVerificationAsync(Guid verificationId, string idDocumentPath)
     {
         try
@@ -358,7 +522,7 @@ public class OcrService : IOcrService
     /// Quickly detects the document type from an image by performing a lightweight OCR scan.
     /// This is used for validation to ensure the uploaded document matches the claimed type.
     /// </summary>
-    public async Task<string?> DetectDocumentTypeAsync(string imagePath)
+    public Task<string?> DetectDocumentTypeAsync(string imagePath)
     {
         try
         {
@@ -374,7 +538,7 @@ public class OcrService : IOcrService
             if (!Directory.Exists(_tesseractDataPath))
             {
                 _logger.LogWarning("Tesseract data path does not exist, cannot detect document type");
-                return null;
+                return Task.FromResult<string?>(null);
             }
 
             TesseractEngine engine;
@@ -385,7 +549,7 @@ public class OcrService : IOcrService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to initialize Tesseract engine for document type detection");
-                return null;
+                return Task.FromResult<string?>(null);
             }
 
             using (engine)
@@ -401,7 +565,7 @@ public class OcrService : IOcrService
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to load image for document type detection: {ImagePath}", imagePath);
-                    return null;
+                    return Task.FromResult<string?>(null);
                 }
 
                 using (img)
@@ -412,20 +576,20 @@ public class OcrService : IOcrService
                     if (string.IsNullOrWhiteSpace(rawText))
                     {
                         _logger.LogWarning("No text extracted from image for document type detection");
-                        return null;
+                        return Task.FromResult<string?>(null);
                     }
 
                     // Detect document type from extracted text
                     var detectedType = InferDocumentTypeFromText(rawText);
                     _logger.LogInformation("Detected document type: {DetectedType} from image: {ImagePath}", detectedType, imagePath);
-                    return detectedType;
+                    return Task.FromResult(detectedType);
                 }
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error detecting document type from image: {ImagePath}", imagePath);
-            return null;
+            return Task.FromResult<string?>(null);
         }
     }
 
@@ -689,6 +853,71 @@ public class OcrService : IOcrService
             return string.Empty;
         }
     }
+
+    private async Task<string> ExtractCitizenshipDetailsTextAsync(string imagePath)
+    {
+        // Best-effort: if English traineddata isn't present, skip the targeted pass.
+        var engDataFile = Path.Combine(_tesseractDataPath, "eng.traineddata");
+        if (!File.Exists(engDataFile))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            using var image = await Image.LoadAsync<Rgb24>(imagePath);
+
+            // On typical Nepal citizenship certificate scans, the English details box occupies the top ~30–40%.
+            var cropHeight = (int)(image.Height * 0.40);
+            cropHeight = Math.Clamp(cropHeight, 1, image.Height);
+
+            image.Mutate(ctx =>
+            {
+                ctx.Crop(new Rectangle(0, 0, image.Width, cropHeight));
+                ctx.Grayscale();
+                ctx.Contrast(1.6f);
+                ctx.GaussianSharpen(2.0f);
+
+                if (image.Width < 2200)
+                {
+                    var scaleFactor = 2200f / image.Width;
+                    ctx.Resize(new ResizeOptions
+                    {
+                        Size = new Size(2200, (int)(image.Height * scaleFactor)),
+                        Mode = ResizeMode.Max,
+                        Sampler = KnownResamplers.Lanczos3
+                    });
+                }
+            });
+
+            var tempPath = Path.Combine(Path.GetTempPath(), $"citizenship_details_{Guid.NewGuid()}.png");
+            await image.SaveAsPngAsync(tempPath);
+
+            try
+            {
+                using var engine = new TesseractEngine(_tesseractDataPath, "eng", EngineMode.Default);
+                engine.SetVariable("tessedit_pageseg_mode", "6");
+                engine.SetVariable("preserve_interword_spaces", "1");
+                engine.SetVariable("user_defined_dpi", "300");
+
+                using var pix = Pix.LoadFromFile(tempPath);
+                using var page = engine.Process(pix);
+                return page.GetText();
+            }
+            finally
+            {
+                if (File.Exists(tempPath))
+                {
+                    try { File.Delete(tempPath); } catch { }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Citizenship details OCR pass failed");
+            return string.Empty;
+        }
+    }
     
     private float EstimateBrightness(Image<Rgb24> image)
     {
@@ -923,7 +1152,7 @@ public class OcrService : IOcrService
             // Extract surname and given names
             var surname = mrzMatch.Groups[2].Value.Trim('<');
             var givenNames = mrzMatch.Groups[3].Value.Replace("<<", " ").Trim();
-            var fullName = $"{surname} {givenNames}".Trim();
+            var fullName = $"{givenNames} {surname}".Trim();
 
             fields["surname"] = new ExtractedFieldDto
             {
@@ -1193,6 +1422,57 @@ public class OcrService : IOcrService
             }
         }
 
+        // Passport surname guard: OCR sometimes captures the tiny token after "SURNAME" (e.g., "BS")
+        // and the actual surname is on the next line (e.g., "SHRESTHA"). Fix only in that case.
+        if (fields.TryGetValue("surname", out var s) && !string.IsNullOrWhiteSpace(s.Value))
+        {
+            var sv = s.Value.Trim();
+            if (sv.Length <= 2)
+            {
+                // Note: text is normalized earlier, so newlines may be gone; handle both layouts.
+                var betterSurname = System.Text.RegularExpressions.Regex.Match(
+                    text,
+                    @"\bSURNAME\b\s+[A-Z0-9]{1,3}\s+([A-Z]{3,30})\b",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                if (!betterSurname.Success)
+                {
+                    betterSurname = System.Text.RegularExpressions.Regex.Match(
+                        text,
+                        @"\bSURNAME\b\s+[A-Z0-9]{1,3}\s*\r?\n\s*([A-Z]{3,30})",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                }
+
+                if (betterSurname.Success)
+                {
+                    var oldShort = sv;
+                    var corrected = betterSurname.Groups[1].Value.Trim();
+
+                    fields["surname"] = new ExtractedFieldDto
+                    {
+                        Value = corrected,
+                        Confidence = s.Confidence,
+                        BoundingBox = s.BoundingBox
+                    };
+
+                    // If fullName was built using the short wrong token, repair it (surname-only change).
+                    if (fields.TryGetValue("fullName", out var fn) && !string.IsNullOrWhiteSpace(fn.Value))
+                    {
+                        var f = fn.Value.Trim();
+                        if (f.EndsWith(" " + oldShort, StringComparison.OrdinalIgnoreCase))
+                        {
+                            fields["fullName"] = new ExtractedFieldDto
+                            {
+                                Value = (f.Substring(0, f.Length - oldShort.Length) + corrected).Trim(),
+                                Confidence = fn.Confidence,
+                                BoundingBox = fn.BoundingBox
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
         // Build fullName from surname and givenNames if not already set
         if (!fields.ContainsKey("fullName") && fields.ContainsKey("surname") && fields.ContainsKey("givenNames"))
         {
@@ -1224,6 +1504,25 @@ public class OcrService : IOcrService
                     Value = $"{givenNames} {surname}".Trim(),
                     Confidence = fields["fullName"].Confidence,
                     BoundingBox = fields["fullName"].BoundingBox
+                };
+            }
+        }
+
+        // Passport requirement: fullName must always be "givenNames surname" when both exist.
+        if (fields.ContainsKey("surname") && fields.ContainsKey("givenNames"))
+        {
+            var surname = fields["surname"].Value?.Trim() ?? "";
+            var givenNames = fields["givenNames"].Value?.Trim() ?? "";
+            if (!string.IsNullOrWhiteSpace(givenNames) && !string.IsNullOrWhiteSpace(surname))
+            {
+                fields["fullName"] = new ExtractedFieldDto
+                {
+                    Value = $"{givenNames} {surname}".Trim(),
+                    Confidence = Math.Max(
+                        fields.GetValueOrDefault("fullName")?.Confidence ?? 0m,
+                        Math.Max(fields["surname"].Confidence, fields["givenNames"].Confidence)),
+                    BoundingBox = fields.GetValueOrDefault("fullName")?.BoundingBox
+                                  ?? new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
                 };
             }
         }
@@ -1377,10 +1676,144 @@ public class OcrService : IOcrService
     {
         var fields = new Dictionary<string, ExtractedFieldDto>();
 
+        // Strong back-side "details box" extractor (English block). This is the most reliable source for:
+        // Citizenship Certificate No, Full Name, Sex, DOB (Year/Month/Day), Birth Place, Permanent Address.
+        var detailsBoxPattern =
+            // Prefer the common 4-part hyphenated certificate number: 31-01-76-04707
+            @"CITIZENSHIP\s*CERTIFICATE\s*NO\.?\s*[:\s]*([0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{5}|[0-9]{1,4}(?:-[0-9]{1,4}){1,6}).*?" +
+            @"SEX[:\s]*(MALE|FEMALE).*?" +
+            // Capture only the name line (don't spill into the next "Year:..." line)
+            @"(?:FULL\s*NAME\.?\s*)?[:\s]*([^\r\n]+)\s*(?:\r?\n|$).*?" +
+            @"YEAR[:\s]*([0-9]{4}).*?MONTH[:\s]*([A-Z]{3,9}).*?DAY[:\s]*([0-9]{1,2}).*?" +
+            @"BIRTH\s*PLACE.*?DISTRICT[:\s]*([A-Z]+).*?" +
+            @"METROPOLITAN\s*[:\s]*([A-Z\s]+?)\s*WARD\s*NO\.?\s*[:\s]*([0-9]{1,2}).*?" +
+            @"PERMANENT\s*ADDRESS.*?DISTRICT[:\s]*([A-Z]+).*?" +
+            @"SUB-?METROPOLITAN\s*[:\s]*([A-Z\s]+?)\s*WARD\s*NO\.?\s*[:\s]*([0-9]{1,2})";
+
+        var detailsBox = System.Text.RegularExpressions.Regex.Match(
+            text,
+            detailsBoxPattern,
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+
+        if (detailsBox.Success)
+        {
+            void Put(string key, string value, decimal conf)
+            {
+                if (fields.ContainsKey(key) || string.IsNullOrWhiteSpace(value)) return;
+                fields[key] = new ExtractedFieldDto
+                {
+                    Value = value.Trim(),
+                    Confidence = conf,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+            }
+
+            Put("documentNumber", detailsBox.Groups[1].Value, 0.97m);
+            Put("sex", detailsBox.Groups[2].Value, 0.92m);
+            var rawName = detailsBox.Groups[3].Value.Trim();
+            // Guard against occasional OCR spill like "AARYAN SHRESTHA Year"
+            rawName = System.Text.RegularExpressions.Regex.Replace(rawName, @"\s+YEAR\b.*$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
+            Put("fullName", rawName, 0.92m);
+            Put("birthYearAD", detailsBox.Groups[4].Value, 0.94m);
+            Put("birthMonthAD", detailsBox.Groups[5].Value.ToUpperInvariant(), 0.94m);
+            Put("birthDayAD", detailsBox.Groups[6].Value, 0.94m);
+            Put("birthDistrict", detailsBox.Groups[7].Value, 0.92m);
+            Put("birthMetropolitan", detailsBox.Groups[8].Value, 0.90m);
+            Put("birthWard", detailsBox.Groups[9].Value, 0.90m);
+            Put("permanentDistrict", detailsBox.Groups[10].Value, 0.92m);
+            Put("permanentSubMetropolitan", detailsBox.Groups[11].Value, 0.90m);
+            Put("permanentWard", detailsBox.Groups[12].Value, 0.90m);
+
+            if (!fields.ContainsKey("dateOfBirth"))
+            {
+                var year = detailsBox.Groups[4].Value.Trim();
+                var monthRaw = detailsBox.Groups[5].Value.Trim().ToUpperInvariant();
+                var day = detailsBox.Groups[6].Value.Trim();
+                var monthNum = monthRaw switch
+                {
+                    "JAN" or "JANUARY" => 1,
+                    "FEB" or "FEBRUARY" => 2,
+                    "MAR" or "MARCH" => 3,
+                    "APR" or "APRIL" => 4,
+                    "MAY" => 5,
+                    "JUN" or "JUNE" => 6,
+                    "JUL" or "JULY" => 7,
+                    "AUG" or "AUGUST" => 8,
+                    "SEP" or "SEPT" or "SEPTEMBER" => 9,
+                    "OCT" or "OCTOBER" => 10,
+                    "NOV" or "NOVEMBER" => 11,
+                    "DEC" or "DECEMBER" => 12,
+                    _ => 0
+                };
+
+                if (monthNum is >= 1 and <= 12 &&
+                    int.TryParse(year, out var y) &&
+                    int.TryParse(day, out var d) &&
+                    d is >= 1 and <= 31)
+                {
+                    Put("dateOfBirth", $"{y:D4}-{monthNum:D2}-{d:D2}", 0.92m);
+                }
+            }
+        }
+
+        // Minimal fallback: if we still missed the two critical fields, extract them directly from the common lines:
+        // "<certificateNo>  Sex ...\n<FULL NAME>"
+        if (!fields.ContainsKey("documentNumber") || string.IsNullOrWhiteSpace(fields.GetValueOrDefault("documentNumber")?.Value) ||
+            !fields.ContainsKey("fullName") || string.IsNullOrWhiteSpace(fields.GetValueOrDefault("fullName")?.Value))
+        {
+            var certAndName = System.Text.RegularExpressions.Regex.Match(
+                text,
+                // Match full certificate no then the next line as name (stop at newline)
+                @"\b([0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{5}|[0-9]{1,4}(?:-[0-9]{1,4}){1,6})\b[^\S\r\n]*.*?(?:SEX\b[^\S\r\n]*:?[\s]*[A-Z]+)?\s*[\r\n]+([^\r\n]+)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+
+            if (certAndName.Success)
+            {
+                if (!fields.ContainsKey("documentNumber"))
+                {
+                    fields["documentNumber"] = new ExtractedFieldDto
+                    {
+                        Value = certAndName.Groups[1].Value.Trim(),
+                        Confidence = 0.97m,
+                        BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                    };
+                }
+
+                if (!fields.ContainsKey("fullName"))
+                {
+                    var nameLine = certAndName.Groups[2].Value.Trim();
+                    nameLine = System.Text.RegularExpressions.Regex.Replace(nameLine, @"\s+YEAR\b.*$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
+                    fields["fullName"] = new ExtractedFieldDto
+                    {
+                        Value = nameLine,
+                        Confidence = 0.92m,
+                        BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                    };
+                }
+            }
+        }
+
+        // Final safeguard for the certificate number: if we somehow captured a partial prefix, replace it with the full 4-part number from text.
+        if (fields.TryGetValue("documentNumber", out var docNo) &&
+            !string.IsNullOrWhiteSpace(docNo.Value) &&
+            System.Text.RegularExpressions.Regex.IsMatch(docNo.Value.Trim(), @"^\d{2}-\d{2}-\d{2}$"))
+        {
+            var full = System.Text.RegularExpressions.Regex.Match(text, @"\b(\d{2}-\d{2}-\d{2}-\d{5})\b");
+            if (full.Success)
+            {
+                fields["documentNumber"] = new ExtractedFieldDto
+                {
+                    Value = full.Groups[1].Value.Trim(),
+                    Confidence = Math.Max(docNo.Confidence, 0.97m),
+                    BoundingBox = docNo.BoundingBox
+                };
+            }
+        }
+
         // Nepalese Citizenship Certificate: front = photo + Nepali; back = English.
         // When the back is uploaded, it is used for data extraction (here). The front is used for face matching. Patterns support both Nepali and English.
-        // Citizenship Certificate No.: 77332286
-        var citizenshipNumberPattern = @"(?:CITIZENSHIP\s*(?:CERTIFICATE\s*)?NO|नागरिकता\s*(?:प्रमाणपत्र\s*)?नं|ना\.प्र\.नं)[:\s]*(\d{8})";
+        // Citizenship Certificate No.: 31-01-76-04707  (often hyphenated)
+        var citizenshipNumberPattern = @"(?:CITIZENSHIP\s*(?:CERTIFICATE\s*)?NO|नागरिकता\s*(?:प्रमाणपत्र\s*)?नं|ना\.प्र\.नं)\.?\s*[:\s]*([0-9]{1,4}(?:-[0-9]{1,4}){1,6})";
         var genericCitizenshipPattern = @"(?:CITIZENSHIP\s*NO|नागरिकता\s*नं)[:\s]*(\d+)";
         
         // Full Name: GANGA RAM SAH
@@ -1389,17 +1822,20 @@ public class OcrService : IOcrService
         // Sex: Male or Female
         var sexPattern = @"(?:SEX|लिङ्ग)[:\s]*(MALE|FEMALE|पुरुष|महिला|[MF])";
         
-        // Date of Birth (AD): (may be blank or in BS format)
+        // Date of Birth (AD): either ISO-like or split Year/Month/Day (common on citizenship back)
         var dobPattern = @"(?:DATE\s*OF\s*BIRTH\s*\(AD\)|जन्म\s*मिति)[:\s]*(\d{4}[-/]\d{1,2}[-/]\d{1,2})";
+        var dobYmdPattern = @"(?:DATE\s*OF\s*BIRTH\s*\(AD\))?.*?YEAR[:\s]*([0-9]{4})\s*MONTH[:\s]*([A-Z]{3,9})\s*DAY[:\s]*([0-9]{1,2})";
         var dobBSPattern = @"(?:जन्म\s*मिति|DATE\s*OF\s*BIRTH)[:\s]*(\d{4}\s*साल|\d{4}[-/]\d{1,2}[-/]\d{1,2})";
         
-        // Birth Place - District: Sarlahi
+        // Birth Place
         var birthDistrictPattern = @"(?:BIRTH\s*PLACE|जन्म\s*स्थान).*?DISTRICT[:\s]*([A-Z]+)";
+        var birthMetroPattern = @"(?:BIRTH\s*PLACE|जन्म\s*स्थान).*?METROPOLITAN\s*[:\s]*([A-Z\s]+?)\s*(?:WARD\s*NO|WARD\s*NO\.|WARD\s*NUMBER|WARD)\s*[:\s]*([0-9]{1,2})";
         var birthVDCPattern = @"(?:VDC|गा\.वि\.\s*स\.)[:\s]*([A-Za-z\s]+)";
-        var birthWardPattern = @"(?:WARD\s*NO|घडा\s*नं|वडा\s*नं)[:\s]*(\d+)";
+        var birthWardPattern = @"(?:WARD\s*NO|WARD\s*NO\.|WARD\s*NUMBER|घडा\s*नं|वडा\s*नं)[:\s]*(\d+)";
         
         // Permanent Address
         var permanentAddressPattern = @"(?:PERMANENT\s*ADDRESS|स्थायी\s*बासस्थान).*?DISTRICT[:\s]*([A-Z]+)";
+        var permanentSubMetroPattern = @"(?:PERMANENT\s*ADDRESS|स्थायी\s*बासस्थान).*?SUB-?METROPOLITAN\s*[:\s]*([A-Z\s]+?)\s*(?:WARD\s*NO|WARD\s*NO\.|WARD\s*NUMBER|WARD)\s*[:\s]*([0-9]{1,2})";
         
         // Father's Name: बाबुको नाम थर
         var fatherNamePattern = @"(?:FATHER['\s]*S\s*NAME|बाबुको\s*नाम|F/H\s*NAME)[:\s]*([A-Z\s]+)";
@@ -1426,14 +1862,116 @@ public class OcrService : IOcrService
         ExtractFieldFromRegex(text, dobPattern, 1, "dateOfBirth", fields, 0.88m);
         if (!fields.ContainsKey("dateOfBirth"))
         {
+            // Try split Year/Month/Day format
+            var ymd = System.Text.RegularExpressions.Regex.Match(text, dobYmdPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+            if (ymd.Success)
+            {
+                var year = ymd.Groups[1].Value.Trim();
+                var monthRaw = ymd.Groups[2].Value.Trim().ToUpperInvariant();
+                var day = ymd.Groups[3].Value.Trim();
+
+                fields["birthYearAD"] = new ExtractedFieldDto
+                {
+                    Value = year,
+                    Confidence = 0.92m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+                fields["birthMonthAD"] = new ExtractedFieldDto
+                {
+                    Value = monthRaw,
+                    Confidence = 0.92m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+                fields["birthDayAD"] = new ExtractedFieldDto
+                {
+                    Value = day,
+                    Confidence = 0.92m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+
+                var monthNum = monthRaw switch
+                {
+                    "JAN" or "JANUARY" => 1,
+                    "FEB" or "FEBRUARY" => 2,
+                    "MAR" or "MARCH" => 3,
+                    "APR" or "APRIL" => 4,
+                    "MAY" => 5,
+                    "JUN" or "JUNE" => 6,
+                    "JUL" or "JULY" => 7,
+                    "AUG" or "AUGUST" => 8,
+                    "SEP" or "SEPT" or "SEPTEMBER" => 9,
+                    "OCT" or "OCTOBER" => 10,
+                    "NOV" or "NOVEMBER" => 11,
+                    "DEC" or "DECEMBER" => 12,
+                    _ => 0
+                };
+
+                if (monthNum is >= 1 and <= 12 &&
+                    int.TryParse(year, out var y) &&
+                    int.TryParse(day, out var d) &&
+                    d is >= 1 and <= 31)
+                {
+                    fields["dateOfBirth"] = new ExtractedFieldDto
+                    {
+                        Value = $"{y:D4}-{monthNum:D2}-{d:D2}",
+                        Confidence = 0.90m,
+                        BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                    };
+                }
+            }
+
             ExtractFieldFromRegex(text, dobBSPattern, 1, "dateOfBirthBS", fields, 0.85m);
         }
         
         ExtractFieldFromRegex(text, birthDistrictPattern, 1, "birthDistrict", fields, 0.85m);
+        var bMetro = System.Text.RegularExpressions.Regex.Match(text, birthMetroPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (bMetro.Success)
+        {
+            if (!fields.ContainsKey("birthMetropolitan"))
+            {
+                fields["birthMetropolitan"] = new ExtractedFieldDto
+                {
+                    Value = bMetro.Groups[1].Value.Trim(),
+                    Confidence = 0.88m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+            }
+            if (!fields.ContainsKey("birthWard"))
+            {
+                fields["birthWard"] = new ExtractedFieldDto
+                {
+                    Value = bMetro.Groups[2].Value.Trim(),
+                    Confidence = 0.88m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+            }
+        }
         ExtractFieldFromRegex(text, birthVDCPattern, 1, "birthVDC", fields, 0.80m);
         ExtractFieldFromRegex(text, birthWardPattern, 1, "birthWard", fields, 0.85m);
         
         ExtractFieldFromRegex(text, permanentAddressPattern, 1, "permanentDistrict", fields, 0.85m);
+        var pSub = System.Text.RegularExpressions.Regex.Match(text, permanentSubMetroPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (pSub.Success)
+        {
+            if (!fields.ContainsKey("permanentSubMetropolitan"))
+            {
+                fields["permanentSubMetropolitan"] = new ExtractedFieldDto
+                {
+                    Value = pSub.Groups[1].Value.Trim(),
+                    Confidence = 0.88m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+            }
+            if (!fields.ContainsKey("permanentWard"))
+            {
+                fields["permanentWard"] = new ExtractedFieldDto
+                {
+                    Value = pSub.Groups[2].Value.Trim(),
+                    Confidence = 0.88m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+            }
+        }
         
         ExtractFieldFromRegex(text, fatherNamePattern, 1, "fatherName", fields, 0.85m);
         ExtractFieldFromRegex(text, motherNamePattern, 1, "motherName", fields, 0.85m);

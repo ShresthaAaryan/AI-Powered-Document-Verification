@@ -157,7 +157,7 @@ export default function VerificationHistoryPage() {
 
               <div className="flex items-center space-x-1">
                 {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
-                  let pageNumber;
+                  let pageNumber: number;
                   if (totalPages <= 5) {
                     pageNumber = i + 1;
                   } else if (pagination.page <= 3) {
@@ -196,19 +196,6 @@ export default function VerificationHistoryPage() {
         )}
 
         {/* Empty State */}
-        {!isLoading && verifications.length === 0 && !error && (
-          <div className="text-center py-12">
-            <div className="text-gray-400 text-4xl mb-4">📋</div>
-            <h3 className="text-lg font-medium text-gray-900 mb-2">No verifications found</h3>
-            <p className="text-gray-600 mb-4">Get started by creating your first verification</p>
-            <button
-              onClick={() => router.push('/verify/new')}
-              className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700"
-            >
-              Create Verification
-            </button>
-          </div>
-        )}
       </div>
     </DashboardLayout>
   );

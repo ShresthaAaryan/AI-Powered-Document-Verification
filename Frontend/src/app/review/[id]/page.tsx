@@ -21,6 +21,11 @@ export default function ReviewDetailPage() {
   const [notes, setNotes] = useState('');
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
 
+  const isPortraitDocument = (doc: { fileName?: string; originalFileName?: string }) => {
+    const name = (doc.originalFileName || doc.fileName || '').toLowerCase();
+    return name.includes('_portrait') || name.includes('-portrait') || name.includes(' portrait.');
+  };
+
   useEffect(() => {
     const loadVerification = async () => {
       try {
@@ -47,9 +52,10 @@ export default function ReviewDetailPage() {
       const authHeaders = authService.getAuthHeader();
 
       const newUrls: Record<string, string> = {};
+      const docs = verification.documents.filter((d) => !isPortraitDocument(d));
 
       await Promise.all(
-        verification.documents.map(async (doc) => {
+        docs.map(async (doc) => {
           if (!doc.mimeType?.startsWith('image/')) return;
 
           const endpoint = `${API_BASE_URL}/verification/${verification.id}/document/${doc.id}`;
@@ -259,7 +265,7 @@ export default function ReviewDetailPage() {
               <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
                 <h2 className="text-lg font-medium text-gray-900 mb-4">Documents</h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {verification.documents.map((doc) => {
+                  {verification.documents.filter((d) => !isPortraitDocument(d)).map((doc) => {
                     const isImage = doc.mimeType?.startsWith('image/');
                     const previewUrl = isImage ? previewUrls[doc.id] : undefined;
 
@@ -368,7 +374,13 @@ export default function ReviewDetailPage() {
                 
                 {verification.ocrResult.extractedFields && Object.keys(verification.ocrResult.extractedFields).length > 0 ? (
                   <dl className="grid grid-cols-2 gap-4">
-                    {Object.entries(verification.ocrResult.extractedFields).map(([key, field]) => (
+                    {Object.entries(verification.ocrResult.extractedFields)
+                      .filter(([key, field]) => {
+                        if (key.toLowerCase() === 'portraitimage') return false;
+                        const v = String(field?.value ?? '').toLowerCase();
+                        return !(v.includes('_portrait') || v.includes('-portrait') || v.includes(' portrait.'));
+                      })
+                      .map(([key, field]) => (
                       <div key={key} className="border-l-2 border-blue-200 pl-3">
                         <dt className="text-sm font-medium text-gray-500 capitalize">
                           {key.replace(/([A-Z])/g, ' $1').trim()}
@@ -576,7 +588,7 @@ export default function ReviewDetailPage() {
                   </div>
                 )}
 
-                {verification.ocrResult && (
+                {/* {verification.ocrResult && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-700 mb-3">OCR Results</h3>
                     <div className="space-y-2">
@@ -600,7 +612,7 @@ export default function ReviewDetailPage() {
                       )}
                     </div>
                   </div>
-                )}
+                )} */}
               </div>
             )}
 
