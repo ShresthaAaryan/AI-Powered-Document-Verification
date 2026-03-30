@@ -58,7 +58,7 @@ public class AIAnalysisService : IAIAnalysisService
             var formatConsistencyScore = await CalculateFormatConsistencyScore(extractedFields, verification.DocumentType);
             var imageQualityScore = await CalculateImageQualityScore(imagePath);
             var templateMatchScore = CalculateTemplateMatchScore(rawText ?? string.Empty, verification.DocumentType);
-            var securityFeaturesScore = await CalculateSecurityFeaturesScore(imagePath);
+            var securityFeaturesScore = await CalculateSecurityFeaturesScore(imagePath, extractedFields, verification.DocumentType);
             var metadataConsistencyScore = await CalculateMetadataConsistencyScore(imagePath);
             
             _logger.LogInformation("Individual scores for verification {VerificationId}: " +
@@ -241,6 +241,9 @@ public class AIAnalysisService : IAIAnalysisService
                     continue; // These are optional fields
                 }
 
+                if (OcrFieldVisibility.InternalOnlyKeys.Contains(field.Key))
+                    continue;
+
                 totalFields++;
 
                 if (ValidateFieldFormat(field.Key, field.Value?.Value))
@@ -299,7 +302,10 @@ public class AIAnalysisService : IAIAnalysisService
         }
     }
 
-    public async Task<int> CalculateSecurityFeaturesScore(string imagePath)
+    public async Task<int> CalculateSecurityFeaturesScore(
+        string imagePath,
+        Dictionary<string, ExtractedFieldDto>? extractedFields = null,
+        string? documentType = null)
     {
         await Task.CompletedTask;
 
@@ -319,6 +325,45 @@ public class AIAnalysisService : IAIAnalysisService
             // Check for microprint (simplified)
             if (CheckForMicroprintPatterns(imagePath)) score += 10;
 
+            score = Math.Min(score, 100);
+
+            // Nepal National ID: emblem + flag heuristics from OCR pipeline (not shown to users)
+            if (string.Equals(documentType, "nationalid", StringComparison.OrdinalIgnoreCase) && extractedFields != null)
+            {
+                var emblem = ParseBoolOcrField(extractedFields, "hasTopLeftNationalEmblem");
+                var flag = ParseBoolOcrField(extractedFields, "hasTopRightNepalFlag");
+                if (emblem && flag)
+                    score = Math.Min(100, score + 12);
+                else if (emblem || flag)
+                    score = Math.Min(100, score + 6);
+                else
+                    score = Math.Max(0, score - 8);
+            }
+
+            // Nepal Citizenship card: front emblem + stamp + back signature/date heuristics (hidden from UI).
+            if (extractedFields != null &&
+                (string.Equals(documentType, "citizenshipcard", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(documentType, "citizenship", StringComparison.OrdinalIgnoreCase)))
+            {
+                var frontEmblem = ParseBoolOcrField(extractedFields, "hasNationalEmblemFront");
+                var frontStamp = ParseBoolOcrField(extractedFields, "hasFrontStamp");
+                var backSignatureWithDate = ParseBoolOcrField(extractedFields, "hasBackSignatureWithDate");
+
+                // Front security marks: both present is strongest signal.
+                if (frontEmblem && frontStamp)
+                    score = Math.Min(100, score + 12);
+                else if (frontEmblem || frontStamp)
+                    score = Math.Min(100, score + 6);
+                else
+                    score = Math.Max(0, score - 8);
+
+                // Back-side signature with date provides an additional authenticity boost.
+                if (backSignatureWithDate)
+                    score = Math.Min(100, score + 8);
+                else
+                    score = Math.Max(0, score - 5);
+            }
+
             return Math.Min(score, 100);
         }
         catch (Exception ex)
@@ -326,6 +371,13 @@ public class AIAnalysisService : IAIAnalysisService
             _logger.LogError(ex, "Error calculating security features score for: {ImagePath}", imagePath);
             return 50; // Default score instead of 0
         }
+    }
+
+    private static bool ParseBoolOcrField(Dictionary<string, ExtractedFieldDto> fields, string key)
+    {
+        if (!fields.TryGetValue(key, out var f) || string.IsNullOrWhiteSpace(f.Value))
+            return false;
+        return bool.TryParse(f.Value.Trim(), out var b) && b;
     }
 
     public async Task<int> CalculateMetadataConsistencyScore(string imagePath)

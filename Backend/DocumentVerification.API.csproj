@@ -29,4 +29,12 @@
     <PackageReference Include="System.Linq.Dynamic.Core" Version="1.7.1" />
   </ItemGroup>
 
+  <!-- Tesseract language data (e.g. nep.traineddata, eng.traineddata) lives under Backend/tessdata -->
+  <ItemGroup>
+    <Content Include="tessdata\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
 </Project>

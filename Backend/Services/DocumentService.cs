@@ -493,7 +493,8 @@ public class DocumentService : IDocumentService
                 LanguageDetected = ocrResult.LanguageDetected,
                 ExtractedFields = string.IsNullOrWhiteSpace(ocrResult.ExtractedFields)
                     ? null
-                    : System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, ExtractedFieldDto>>(ocrResult.ExtractedFields)
+                    : OcrFieldVisibility.ForPublicApi(
+                        System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, ExtractedFieldDto>>(ocrResult.ExtractedFields))
             },
             AuthenticityScore = authenticityScore == null ? null : new AuthenticityScoreDto
             {

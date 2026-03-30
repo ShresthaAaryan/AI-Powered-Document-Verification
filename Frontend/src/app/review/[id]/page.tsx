@@ -376,7 +376,8 @@ export default function ReviewDetailPage() {
                   <dl className="grid grid-cols-2 gap-4">
                     {Object.entries(verification.ocrResult.extractedFields)
                       .filter(([key, field]) => {
-                        if (key.toLowerCase() === 'portraitimage') return false;
+                        const k = key.toLowerCase();
+                        if (k === 'portraitimage' || k === 'hastopleftnationalemblem' || k === 'hastoprightnepalflag' || k === 'nationalidentitynumber') return false;
                         const v = String(field?.value ?? '').toLowerCase();
                         return !(v.includes('_portrait') || v.includes('-portrait') || v.includes(' portrait.'));
                       })

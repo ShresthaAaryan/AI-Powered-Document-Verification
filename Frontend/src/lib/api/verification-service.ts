@@ -62,8 +62,6 @@ class VerificationService {
       currentPage: request.page || 1,
       pageSize: request.pageSize || 20,
       totalPages: Math.ceil(response.length / (request.pageSize || 20)),
-      hasNextPage: false,
-      hasPreviousPage: false,
     };
   }
 
@@ -87,17 +85,11 @@ class VerificationService {
       currentPage: request.page || 1,
       pageSize: request.pageSize || 20,
       totalPages: Math.ceil(response.length / (request.pageSize || 20)),
-      hasNextPage: false,
-      hasPreviousPage: false,
     };
   }
 
   async updateVerificationStatus(id: string, request: UpdateStatusRequest): Promise<VerificationDto> {
     return apiClient.put<VerificationDto>(`/verification/${id}/status`, request);
-  }
-
-  async deleteVerification(id: string): Promise<void> {
-    return apiClient.delete<void>(`/verification/${id}`);
   }
 
   async downloadDocument(verificationId: string, documentId: string, filename?: string): Promise<void> {
@@ -144,8 +136,6 @@ class VerificationService {
       currentPage: request.page || 1,
       pageSize: request.pageSize || 20,
       totalPages: Math.ceil(response.length / (request.pageSize || 20)),
-      hasNextPage: false,
-      hasPreviousPage: false,
     };
   }
 

@@ -434,14 +434,6 @@ export default function VerificationStatus() {
             >
               Review
             </button>
-            {verification.status === 'Approved' && (
-              <button
-                onClick={() => router.push(`/verify/${verificationId}/status`)}
-                className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700"
-              >
-                View Results
-              </button>
-            )}
             <button
               onClick={() => router.push('/dashboard')}
               className="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700"

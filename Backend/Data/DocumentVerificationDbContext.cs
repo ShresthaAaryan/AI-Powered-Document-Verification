@@ -123,13 +123,13 @@ public class DocumentVerificationDbContext : IdentityDbContext<IdentityUser>
         var adminUser = new IdentityUser
         {
             Id = "1",
-            UserName = "admin@docverify.com",
-            Email = "admin@docverify.com",
+            UserName = "aaryan@gmail.com",
+            Email = "aaryan@gmail.com",
             EmailConfirmed = true,
             SecurityStamp = Guid.NewGuid().ToString()
         };
 
-        adminUser.PasswordHash = new PasswordHasher<IdentityUser>().HashPassword(adminUser, "Admin123!");
+        adminUser.PasswordHash = new PasswordHasher<IdentityUser>().HashPassword(adminUser, "Doc12345");
 
         builder.Entity<IdentityUser>().HasData(adminUser);
 

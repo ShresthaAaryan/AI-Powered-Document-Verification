@@ -584,7 +584,9 @@ public class WorkflowService : IWorkflowService
         }
 
         if (text.Contains("NATIONAL IDENTITY") || text.Contains("NATIONAL IDENTITY CARD") ||
-            text.Contains("NATIONAL IDENTITY NUMBER") || text.Contains("NIN"))
+            text.Contains("NATIONAL IDENTITY NUMBER") || text.Contains("NIN") ||
+            text.Contains("राष्ट्रिय परिचय") ||
+            (text.Contains("GOVERNMENT OF NEPAL") && text.Contains("IDENTITY")))
         {
             return "NationalID";
         }

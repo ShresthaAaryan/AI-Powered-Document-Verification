@@ -4,6 +4,7 @@ using DocumentVerification.API.Models.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using Tesseract;
  using SixLabors.ImageSharp;
@@ -263,6 +264,16 @@ public class OcrService : IOcrService
                         }
                     }
 
+                    // Nepal National Identity Card: dense bilingual text on the left; photo on the right.
+                    if (documentType.Equals("nationalid", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var nidText = await ExtractNepalNationalIdDetailsTextAsync(imagePath);
+                        if (!string.IsNullOrWhiteSpace(nidText))
+                        {
+                            rawText = nidText + "\n" + rawText;
+                        }
+                    }
+
                     stopwatch.Stop();
 
                     // Clean up preprocessed image
@@ -297,12 +308,22 @@ public class OcrService : IOcrService
                         };
                     }
 
-                    // Citizenship: check for typical logos/stamps (best-effort heuristics).
+                    // Citizenship: front = national emblem (top-left) + stamp (top-right); back = signature + date (bottom-right).
                     if (documentType.Equals("citizenship", StringComparison.OrdinalIgnoreCase) ||
                         documentType.Equals("citizenshipcard", StringComparison.OrdinalIgnoreCase))
                     {
-                        var markFields = await DetectCitizenshipMarksAsync(imagePath);
+                        var markFields = await DetectCitizenshipMarksAsync(verificationId);
                         foreach (var kvp in markFields)
+                        {
+                            extractedFields[kvp.Key] = kvp.Value;
+                        }
+                    }
+
+                    // Nepal National ID: emblem (top-left) and flag (top-right) heuristics.
+                    if (documentType.Equals("nationalid", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var nidMarks = await DetectNepalNationalIdMarksAsync(imagePath);
+                        foreach (var kvp in nidMarks)
                         {
                             extractedFields[kvp.Key] = kvp.Value;
                         }
@@ -371,10 +392,11 @@ public class OcrService : IOcrService
         // Default to configured language.
         var lang = _tesseractLanguage;
 
-        // Nepal citizenship: front is largely Nepali; back is English + Nepali.
-        // If nep.traineddata exists, prefer eng+nep (keeps English details readable too).
+        // Nepal citizenship / National ID: bilingual Nepali + English.
+        // If nep.traineddata exists, prefer eng+nep (keeps English labels readable too).
         if (documentType.Equals("citizenship", StringComparison.OrdinalIgnoreCase) ||
-            documentType.Equals("citizenshipcard", StringComparison.OrdinalIgnoreCase))
+            documentType.Equals("citizenshipcard", StringComparison.OrdinalIgnoreCase) ||
+            documentType.Equals("nationalid", StringComparison.OrdinalIgnoreCase))
         {
             var nep = Path.Combine(_tesseractDataPath, "nep.traineddata");
             var eng = Path.Combine(_tesseractDataPath, "eng.traineddata");
@@ -391,112 +413,246 @@ public class OcrService : IOcrService
         return lang;
     }
 
-    private async Task<Dictionary<string, ExtractedFieldDto>> DetectCitizenshipMarksAsync(string imagePath)
+    /// <summary>
+    /// Citizenship card: front image — top-left national emblem, top-right official stamp.
+    /// Back image — bottom-right handwritten signature with an issue date nearby.
+    /// </summary>
+    private async Task<Dictionary<string, ExtractedFieldDto>> DetectCitizenshipMarksAsync(Guid verificationId)
     {
         var fields = new Dictionary<string, ExtractedFieldDto>();
 
         try
         {
-            using var image = await Image.LoadAsync<Rgb24>(imagePath);
+            var docs = await _context.Documents.AsNoTracking()
+                .Where(d => d.VerificationId == verificationId)
+                .ToListAsync();
 
-            // Regions tuned to typical Nepal citizenship scans:
-            // - National emblem/logo: top-left
-            // - Top-right emblem/stamp/logo mark (often blue)
-            var emblemRegion = new Rectangle(0, 0, (int)(image.Width * 0.22), (int)(image.Height * 0.18));
-            var stampRegion = new Rectangle((int)(image.Width * 0.72), 0, (int)(image.Width * 0.28), (int)(image.Height * 0.25));
+            var frontPath = docs.FirstOrDefault(d => d.DocumentType == "IDDocument")?.FilePath;
+            var backPath = docs.FirstOrDefault(d => d.DocumentType == "IDDocumentBack")?.FilePath;
 
-            var (emblemScore, stampScore, redInkScore) = MeasureColorSignals(image, emblemRegion, stampRegion);
+            if (!string.IsNullOrWhiteSpace(frontPath) && File.Exists(frontPath))
+                await DetectCitizenshipFrontEmblemAndStampAsync(frontPath, fields);
 
-            // Explicit top-right check (what you asked for on the front side).
-            fields["hasTopRightEmblemStamp"] = new ExtractedFieldDto
-            {
-                Value = (stampScore > 0.010f).ToString(),
-                Confidence = (decimal)Math.Clamp(stampScore * 35f, 0.50f, 0.95f),
-                BoundingBox = new BoundingBoxDto { X = stampRegion.X, Y = stampRegion.Y, Width = stampRegion.Width, Height = stampRegion.Height }
-            };
-
-            // Red ink signature/stamp marks are common (e.g., red pen strokes).
-            fields["hasRedInkMark"] = new ExtractedFieldDto
-            {
-                Value = (redInkScore > 0.0025f).ToString(),
-                Confidence = (decimal)Math.Clamp(redInkScore * 80f, 0.50f, 0.95f),
-                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = image.Width, Height = image.Height }
-            };
+            if (!string.IsNullOrWhiteSpace(backPath) && File.Exists(backPath))
+                await DetectCitizenshipBackSignatureWithDateAsync(backPath, fields);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Citizenship stamp/logo detection failed");
+            _logger.LogWarning(ex, "Citizenship emblem/stamp/signature detection failed for verification {VerificationId}", verificationId);
         }
 
         return fields;
     }
 
-    private static (float emblemRedRatio, float stampBlueRatio, float globalRedRatio) MeasureColorSignals(
-        Image<Rgb24> image,
-        Rectangle emblemRegion,
-        Rectangle stampRegion)
+    /// <summary>Front: top-left coat of arms / emblem; top-right round stamp (often blue).</summary>
+    private async Task DetectCitizenshipFrontEmblemAndStampAsync(string frontImagePath, Dictionary<string, ExtractedFieldDto> fields)
     {
-        static float Saturation(byte r, byte g, byte b)
+        await Task.CompletedTask;
+
+        using var image = await Image.LoadAsync<Rgb24>(frontImagePath);
+        var w = image.Width;
+        var h = image.Height;
+
+        var emblemRegion = new Rectangle(0, 0, (int)(w * 0.26), (int)(h * 0.24));
+        var stampRegion = new Rectangle((int)(w * 0.68), 0, (int)(w * 0.32), (int)(h * 0.28));
+
+        var emblemSignal = Math.Max(
+            CountRedRatio(image, emblemRegion),
+            CountGreenRatio(image, emblemRegion));
+        var stampBlue = CountBlueRatio(image, stampRegion);
+
+        fields["hasNationalEmblemFront"] = new ExtractedFieldDto
         {
-            var max = Math.Max(r, Math.Max(g, b));
-            var min = Math.Min(r, Math.Min(g, b));
+            Value = (emblemSignal > 0.008f).ToString(),
+            Confidence = (decimal)Math.Clamp(emblemSignal * 38f, 0.50f, 0.95f),
+            BoundingBox = new BoundingBoxDto { X = emblemRegion.X, Y = emblemRegion.Y, Width = emblemRegion.Width, Height = emblemRegion.Height }
+        };
+
+        fields["hasFrontStamp"] = new ExtractedFieldDto
+        {
+            Value = (stampBlue > 0.010f).ToString(),
+            Confidence = (decimal)Math.Clamp(stampBlue * 36f, 0.50f, 0.95f),
+            BoundingBox = new BoundingBoxDto { X = stampRegion.X, Y = stampRegion.Y, Width = stampRegion.Width, Height = stampRegion.Height }
+        };
+    }
+
+    /// <summary>Back: bottom-right — dark signature strokes + a date string (dd-mm-yyyy style) via light OCR on crop.</summary>
+    private async Task DetectCitizenshipBackSignatureWithDateAsync(string backImagePath, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        try
+        {
+            using var image = await Image.LoadAsync<Rgb24>(backImagePath);
+            var w = image.Width;
+            var h = image.Height;
+
+            // Bottom-right quadrant (signature + date area on Nepal citizenship back).
+            var sigRegion = new Rectangle((int)(w * 0.58), (int)(h * 0.62), (int)(w * 0.42), (int)(h * 0.38));
+            sigRegion = Rectangle.Intersect(new Rectangle(0, 0, w, h), sigRegion);
+            if (sigRegion.Width <= 0 || sigRegion.Height <= 0) return;
+
+            var darkInk = CountDarkInkRatio(image, sigRegion);
+            var hasSig = darkInk > 0.018f;
+
+            var dateFound = false;
+            var tempPath = Path.Combine(Path.GetTempPath(), $"citizenship_sig_{Guid.NewGuid()}.png");
+            try
+            {
+                using (var crop = image.Clone(ctx => ctx.Crop(sigRegion)))
+                {
+                    if (crop.Width < 500)
+                    {
+                        var scale = 500f / crop.Width;
+                        crop.Mutate(x => x.Resize((int)(crop.Width * scale), (int)(crop.Height * scale)));
+                    }
+                    crop.Mutate(x =>
+                    {
+                        x.Grayscale();
+                        x.Contrast(1.35f);
+                    });
+                    await crop.SaveAsPngAsync(tempPath);
+                }
+
+                var engData = Path.Combine(_tesseractDataPath, "eng.traineddata");
+                if (File.Exists(engData))
+                {
+                    using var engine = new TesseractEngine(_tesseractDataPath, "eng", EngineMode.Default);
+                    engine.SetVariable("tessedit_pageseg_mode", "6");
+                    using var pix = Pix.LoadFromFile(tempPath);
+                    using var page = engine.Process(pix);
+                    var txt = page.GetText() ?? "";
+                    dateFound = System.Text.RegularExpressions.Regex.IsMatch(txt,
+                        @"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b|\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b");
+                }
+            }
+            finally
+            {
+                if (File.Exists(tempPath))
+                {
+                    try { File.Delete(tempPath); } catch { }
+                }
+            }
+
+            var combined = hasSig && dateFound;
+            fields["hasBackSignatureWithDate"] = new ExtractedFieldDto
+            {
+                Value = combined.ToString(),
+                Confidence = (decimal)Math.Clamp((decimal)(darkInk * 22f) + (dateFound ? 0.35m : 0m), 0.50m, 0.92m),
+                BoundingBox = new BoundingBoxDto { X = sigRegion.X, Y = sigRegion.Y, Width = sigRegion.Width, Height = sigRegion.Height }
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Citizenship back signature/date check failed");
+        }
+    }
+
+    private static float CountRedRatio(Image<Rgb24> image, Rectangle r)
+    {
+        static float Sat(byte rr, byte g, byte b)
+        {
+            var max = Math.Max(rr, Math.Max(g, b));
+            var min = Math.Min(rr, Math.Min(g, b));
             return max == 0 ? 0f : (max - min) / (float)max;
         }
 
-        float CountRed(Rectangle r)
-        {
-            r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
-            if (r.Width <= 0 || r.Height <= 0) return 0f;
+        r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+        if (r.Width <= 0 || r.Height <= 0) return 0f;
 
-            long red = 0;
-            long total = 0;
-            var step = Math.Max(1, Math.Min(r.Width, r.Height) / 220);
-            for (var y = r.Y; y < r.Y + r.Height; y += step)
+        long red = 0;
+        long total = 0;
+        var step = Math.Max(1, Math.Min(r.Width, r.Height) / 200);
+        for (var y = r.Y; y < r.Y + r.Height; y += step)
+        {
+            for (var x = r.X; x < r.X + r.Width; x += step)
             {
-                for (var x = r.X; x < r.X + r.Width; x += step)
-                {
-                    var p = image[x, y];
-                    var sat = Saturation(p.R, p.G, p.B);
-                    // Red-ish pixel (tolerant to faded/pink emblem on yellow security paper).
-                    if (sat > 0.22f && p.R >= p.G + 18 && p.R >= p.B + 18)
-                        red++;
-                    total++;
-                }
+                var p = image[x, y];
+                var sat = Sat(p.R, p.G, p.B);
+                if (sat > 0.20f && p.R >= p.G + 16 && p.R >= p.B + 14)
+                    red++;
+                total++;
             }
-            return total > 0 ? (float)red / total : 0f;
+        }
+        return total > 0 ? (float)red / total : 0f;
+    }
+
+    private static float CountGreenRatio(Image<Rgb24> image, Rectangle r)
+    {
+        static float Sat(byte rr, byte g, byte b)
+        {
+            var max = Math.Max(rr, Math.Max(g, b));
+            var min = Math.Min(rr, Math.Min(g, b));
+            return max == 0 ? 0f : (max - min) / (float)max;
         }
 
-        float CountBlue(Rectangle r)
-        {
-            r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
-            if (r.Width <= 0 || r.Height <= 0) return 0f;
+        r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+        if (r.Width <= 0 || r.Height <= 0) return 0f;
 
-            long blue = 0;
-            long total = 0;
-            var step = Math.Max(1, Math.Min(r.Width, r.Height) / 220);
-            for (var y = r.Y; y < r.Y + r.Height; y += step)
+        long green = 0;
+        long total = 0;
+        var step = Math.Max(1, Math.Min(r.Width, r.Height) / 200);
+        for (var y = r.Y; y < r.Y + r.Height; y += step)
+        {
+            for (var x = r.X; x < r.X + r.Width; x += step)
             {
-                for (var x = r.X; x < r.X + r.Width; x += step)
-                {
-                    var p = image[x, y];
-                    var sat = Saturation(p.R, p.G, p.B);
-                    // Blue-ish pixel (tolerant to light stamp ink).
-                    if (sat > 0.18f && p.B >= p.R + 12 && p.B >= p.G + 10)
-                        blue++;
-                    total++;
-                }
+                var p = image[x, y];
+                var sat = Sat(p.R, p.G, p.B);
+                if (sat > 0.16f && p.G >= p.R + 8 && p.G >= p.B + 6)
+                    green++;
+                total++;
             }
-            return total > 0 ? (float)blue / total : 0f;
+        }
+        return total > 0 ? (float)green / total : 0f;
+    }
+
+    private static float CountBlueRatio(Image<Rgb24> image, Rectangle r)
+    {
+        static float Sat(byte rr, byte g, byte b)
+        {
+            var max = Math.Max(rr, Math.Max(g, b));
+            var min = Math.Min(rr, Math.Min(g, b));
+            return max == 0 ? 0f : (max - min) / (float)max;
         }
 
-        var emblemRed = CountRed(emblemRegion);
-        var stampBlue = CountBlue(stampRegion);
+        r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+        if (r.Width <= 0 || r.Height <= 0) return 0f;
 
-        // Scan whole image (sampled) for red ink marks.
-        var global = new Rectangle(0, 0, image.Width, image.Height);
-        var globalRed = CountRed(global);
+        long blue = 0;
+        long total = 0;
+        var step = Math.Max(1, Math.Min(r.Width, r.Height) / 200);
+        for (var y = r.Y; y < r.Y + r.Height; y += step)
+        {
+            for (var x = r.X; x < r.X + r.Width; x += step)
+            {
+                var p = image[x, y];
+                var sat = Sat(p.R, p.G, p.B);
+                if (sat > 0.16f && p.B >= p.R + 10 && p.B >= p.G + 8)
+                    blue++;
+                total++;
+            }
+        }
+        return total > 0 ? (float)blue / total : 0f;
+    }
 
-        return (emblemRed, stampBlue, globalRed);
+    private static float CountDarkInkRatio(Image<Rgb24> image, Rectangle r)
+    {
+        r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+        if (r.Width <= 0 || r.Height <= 0) return 0f;
+
+        long dark = 0;
+        long total = 0;
+        var step = Math.Max(1, Math.Min(r.Width, r.Height) / 180);
+        for (var y = r.Y; y < r.Y + r.Height; y += step)
+        {
+            for (var x = r.X; x < r.X + r.Width; x += step)
+            {
+                var p = image[x, y];
+                var lum = (0.299f * p.R + 0.587f * p.G + 0.114f * p.B) / 255f;
+                if (lum < 0.42f)
+                    dark++;
+                total++;
+            }
+        }
+        return total > 0 ? (float)dark / total : 0f;
     }
 
     public async Task<OcrResultDto> ProcessVerificationAsync(Guid verificationId, string idDocumentPath)
@@ -619,10 +775,11 @@ public class OcrService : IOcrService
             return "DriversLicense";
         }
 
-        // Check for National ID indicators
+        // Check for National ID indicators (Nepal NID: bilingual header)
         if (text.Contains("NATIONAL IDENTITY") || text.Contains("NATIONAL IDENTITY CARD") ||
             text.Contains("NATIONAL IDENTITY NUMBER") || text.Contains("NIN") ||
-            text.Contains("परिचय नम्वर"))
+            text.Contains("परिचय नम्वर") || text.Contains("राष्ट्रिय परिचय") ||
+            text.Contains("GOVERNMENT OF NEPAL") && text.Contains("IDENTITY"))
         {
             return "NationalID";
         }
@@ -918,6 +1075,174 @@ public class OcrService : IOcrService
             return string.Empty;
         }
     }
+
+    /// <summary>
+    /// Second OCR pass focused on the Nepal NID text column (left/middle), excluding most of the portrait on the right.
+    /// </summary>
+    private async Task<string> ExtractNepalNationalIdDetailsTextAsync(string imagePath)
+    {
+        var engDataFile = Path.Combine(_tesseractDataPath, "eng.traineddata");
+        if (!File.Exists(engDataFile))
+            return string.Empty;
+
+        try
+        {
+            using var image = await Image.LoadAsync<Rgb24>(imagePath);
+            var w = image.Width;
+            var h = image.Height;
+
+            var cropX = 0;
+            var cropY = (int)(h * 0.10);
+            var cropW = (int)(w * 0.78);
+            var cropH = Math.Clamp((int)(h * 0.86), 1, h - cropY);
+            cropW = Math.Clamp(cropW, 1, w - cropX);
+            cropH = Math.Clamp(cropH, 1, h - cropY);
+
+            image.Mutate(ctx =>
+            {
+                ctx.Crop(new Rectangle(cropX, cropY, cropW, cropH));
+                ctx.Grayscale();
+                ctx.Contrast(1.45f);
+                ctx.GaussianSharpen(1.8f);
+
+                if (image.Width < 1800)
+                {
+                    var scaleFactor = 1800f / image.Width;
+                    ctx.Resize(new ResizeOptions
+                    {
+                        Size = new Size(1800, (int)(image.Height * scaleFactor)),
+                        Mode = ResizeMode.Max,
+                        Sampler = KnownResamplers.Lanczos3
+                    });
+                }
+            });
+
+            var tempPath = Path.Combine(Path.GetTempPath(), $"nepal_nid_details_{Guid.NewGuid()}.png");
+            await image.SaveAsPngAsync(tempPath);
+
+            try
+            {
+                var nep = Path.Combine(_tesseractDataPath, "nep.traineddata");
+                var lang = File.Exists(nep) ? "eng+nep" : "eng";
+                using var engine = new TesseractEngine(_tesseractDataPath, lang, EngineMode.Default);
+                engine.SetVariable("tessedit_pageseg_mode", "6");
+                engine.SetVariable("preserve_interword_spaces", "1");
+                engine.SetVariable("user_defined_dpi", "300");
+
+                using var pix = Pix.LoadFromFile(tempPath);
+                using var page = engine.Process(pix);
+                return page.GetText();
+            }
+            finally
+            {
+                if (File.Exists(tempPath))
+                {
+                    try { File.Delete(tempPath); } catch { }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Nepal National ID details OCR pass failed");
+            return string.Empty;
+        }
+    }
+
+    private async Task<Dictionary<string, ExtractedFieldDto>> DetectNepalNationalIdMarksAsync(string imagePath)
+    {
+        var fields = new Dictionary<string, ExtractedFieldDto>();
+
+        try
+        {
+            using var image = await Image.LoadAsync<Rgb24>(imagePath);
+
+            var emblemRegion = new Rectangle(0, 0, (int)(image.Width * 0.26), (int)(image.Height * 0.24));
+            var flagRegion = new Rectangle((int)(image.Width * 0.70), 0, (int)(image.Width * 0.30), (int)(image.Height * 0.28));
+
+            var (emblemRed, emblemBlue, flagRed, flagBlue) = MeasureNepalNidBrandingSignals(image, emblemRegion, flagRegion);
+
+            var emblemScore = Math.Max(emblemRed, emblemBlue);
+            fields["hasTopLeftNationalEmblem"] = new ExtractedFieldDto
+            {
+                Value = (emblemScore > 0.008f).ToString(),
+                Confidence = (decimal)Math.Clamp(emblemScore * 40f, 0.50f, 0.92f),
+                BoundingBox = new BoundingBoxDto { X = emblemRegion.X, Y = emblemRegion.Y, Width = emblemRegion.Width, Height = emblemRegion.Height }
+            };
+
+            var flagScore = Math.Max(flagRed, flagBlue * 0.85f);
+            fields["hasTopRightNepalFlag"] = new ExtractedFieldDto
+            {
+                Value = (flagScore > 0.012f).ToString(),
+                Confidence = (decimal)Math.Clamp(flagScore * 38f, 0.50f, 0.92f),
+                BoundingBox = new BoundingBoxDto { X = flagRegion.X, Y = flagRegion.Y, Width = flagRegion.Width, Height = flagRegion.Height }
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Nepal National ID branding detection failed");
+        }
+
+        return fields;
+    }
+
+    private static (float emblemRed, float emblemBlue, float flagRed, float flagBlue) MeasureNepalNidBrandingSignals(
+        Image<Rgb24> image,
+        Rectangle emblemRegion,
+        Rectangle flagRegion)
+    {
+        static float Saturation(byte r, byte g, byte b)
+        {
+            var max = Math.Max(r, Math.Max(g, b));
+            var min = Math.Min(r, Math.Min(g, b));
+            return max == 0 ? 0f : (max - min) / (float)max;
+        }
+
+        float CountRed(Rectangle r)
+        {
+            r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+            if (r.Width <= 0 || r.Height <= 0) return 0f;
+
+            long red = 0;
+            long total = 0;
+            var step = Math.Max(1, Math.Min(r.Width, r.Height) / 200);
+            for (var y = r.Y; y < r.Y + r.Height; y += step)
+            {
+                for (var x = r.X; x < r.X + r.Width; x += step)
+                {
+                    var p = image[x, y];
+                    var sat = Saturation(p.R, p.G, p.B);
+                    if (sat > 0.20f && p.R >= p.G + 16 && p.R >= p.B + 14)
+                        red++;
+                    total++;
+                }
+            }
+            return total > 0 ? (float)red / total : 0f;
+        }
+
+        float CountBlue(Rectangle r)
+        {
+            r = Rectangle.Intersect(new Rectangle(0, 0, image.Width, image.Height), r);
+            if (r.Width <= 0 || r.Height <= 0) return 0f;
+
+            long blue = 0;
+            long total = 0;
+            var step = Math.Max(1, Math.Min(r.Width, r.Height) / 200);
+            for (var y = r.Y; y < r.Y + r.Height; y += step)
+            {
+                for (var x = r.X; x < r.X + r.Width; x += step)
+                {
+                    var p = image[x, y];
+                    var sat = Saturation(p.R, p.G, p.B);
+                    if (sat > 0.16f && p.B >= p.R + 10 && p.B >= p.G + 8)
+                        blue++;
+                    total++;
+                }
+            }
+            return total > 0 ? (float)blue / total : 0f;
+        }
+
+        return (CountRed(emblemRegion), CountBlue(emblemRegion), CountRed(flagRegion), CountBlue(flagRegion));
+    }
     
     private float EstimateBrightness(Image<Rgb24> image)
     {
@@ -1008,43 +1333,35 @@ public class OcrService : IOcrService
             return fields;
         }
         
-        // Normalize text - replace common OCR errors
-        text = NormalizeOcrText(text);
+        // Flatten for MRZ; keep separate line-normalized text for PoB / issuing authority.
+        var textFlat = NormalizeOcrText(text);
+        var textLines = NormalizePassportOcrLines(text);
         
-        var allLines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var allLines = textLines.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         _logger.LogDebug("Parsing passport fields from {LineCount} lines of text", allLines.Length);
 
-        // Improved MRZ pattern for Nepali and international passports
-        // Pattern Line 1: P<[country]<[surname]<<[given names]<<<<...
-        // Pattern Line 2: [passport number][country][DOB YYMMDD][sex][expiry YYMMDD][personal number][check digits]
-        // Example: P<NPLSHRESTHA<<AARYAN<<<<...
-        //          PA02248555NPL0212311M320327131017604707<<<80
-        //          PAD2248555NPL0212311M320327131017604707<<< (single-line format)
-        //          PBNPLCITIZEN<<JOHN<<<<... (from Nepali passport)
-        //          BA00000000NPL0000000M00000000... (MRZ line 2)
-        var mrzPattern = @"P<([A-Z]{3})<([A-Z]+)<<([A-Z]+(?:<<[A-Z]+)*)";
-        // MRZ Line 2 pattern: [passport(9)][country(3)][DOB(6)][check(1)][sex(1)][expiry(6)][personal(14)][checks]
-        // Groups: 1=passport, 2=country, 3=DOB, 4=check, 5=sex, 6=expiry, 7=personal
-        // More flexible pattern to handle various formats
-        var mrzLine2Pattern = @"([A-Z0-9]{9})([A-Z]{3})([0-9]{6})([0-9])([MF<])([0-9]{6})([A-Z0-9<]{0,14})";
+        // ICAO TD3 line 1: P< + country(3) + surname + << + given (no < between country and surname)
+        // Example: P<NPLSHRESTHA<<AARYAN<<<<...  OCR may use EP<...
+        var mrzPattern = @"E?P<([A-Z]{3})([A-Z]+)<<([A-Z]+(?:<[A-Z]+)*)";
+        // Line 2: passport no. (e.g. PA + 7–9 digits) + NPL + dates...
+        var mrzLine2Pattern = @"([A-Z]{2}\d{7,10})([A-Z]{3})([0-9]{6})([0-9])([MF<])([0-9]{6})([A-Z0-9<]{0,20})";
         
         // Also try single-line MRZ format: P[A-Z][passport][country][DOB][check][sex][expiry][personal]
         var singleLineMrzPattern = @"P([A-Z])([A-Z0-9]{7,9})([A-Z]{3})([0-9]{6})([0-9])([MF<])([0-9]{6})([A-Z0-9<]{0,14})";
         
         // Try to match MRZ (usually at the end of the text)
-        // First, try to find MRZ lines - they're usually the last 2 lines
-        var mrzText = allLines.Length >= 2 ? string.Join("\n", allLines.TakeLast(2)) : text;
+        var mrzText = allLines.Length >= 2 ? string.Join("\n", allLines.TakeLast(2)) : textFlat;
         
         var mrzMatch = System.Text.RegularExpressions.Regex.Match(mrzText, mrzPattern, System.Text.RegularExpressions.RegexOptions.Multiline);
         var mrzLine2Match = System.Text.RegularExpressions.Regex.Match(mrzText, mrzLine2Pattern, System.Text.RegularExpressions.RegexOptions.Multiline);
         var singleLineMrzMatch = System.Text.RegularExpressions.Regex.Match(mrzText, singleLineMrzPattern, System.Text.RegularExpressions.RegexOptions.Multiline);
         
-        // If not found in last 2 lines, try the whole text
+        // If not found in last 2 lines, try the whole flattened text
         if ((!mrzMatch.Success || !mrzLine2Match.Success) && !singleLineMrzMatch.Success)
         {
-            mrzMatch = System.Text.RegularExpressions.Regex.Match(text, mrzPattern, System.Text.RegularExpressions.RegexOptions.Multiline);
-            mrzLine2Match = System.Text.RegularExpressions.Regex.Match(text, mrzLine2Pattern, System.Text.RegularExpressions.RegexOptions.Multiline);
-            singleLineMrzMatch = System.Text.RegularExpressions.Regex.Match(text, singleLineMrzPattern, System.Text.RegularExpressions.RegexOptions.Multiline);
+            mrzMatch = System.Text.RegularExpressions.Regex.Match(textFlat, mrzPattern, System.Text.RegularExpressions.RegexOptions.Multiline);
+            mrzLine2Match = System.Text.RegularExpressions.Regex.Match(textFlat, mrzLine2Pattern, System.Text.RegularExpressions.RegexOptions.Multiline);
+            singleLineMrzMatch = System.Text.RegularExpressions.Regex.Match(textFlat, singleLineMrzPattern, System.Text.RegularExpressions.RegexOptions.Multiline);
         }
         
         // Handle single-line MRZ format
@@ -1151,7 +1468,10 @@ public class OcrService : IOcrService
 
             // Extract surname and given names
             var surname = mrzMatch.Groups[2].Value.Trim('<');
-            var givenNames = mrzMatch.Groups[3].Value.Replace("<<", " ").Trim();
+            var givenNames = System.Text.RegularExpressions.Regex.Replace(
+                mrzMatch.Groups[3].Value.Replace("<", " ").Trim(),
+                @"\s+",
+                " ");
             var fullName = $"{givenNames} {surname}".Trim();
 
             fields["surname"] = new ExtractedFieldDto
@@ -1242,18 +1562,215 @@ public class OcrService : IOcrService
         }
 
         // Also try to extract from visible text fields (for Nepali passports with bilingual text)
-        ExtractPassportVisibleFields(text, fields);
+        ExtractPassportVisibleFields(textFlat, textLines, fields);
 
         // Fallback to regex pattern matching if MRZ parsing failed
         if (fields.Count == 0)
         {
-            return ExtractFieldsWithRegex(text, fields);
+            ExtractFieldsWithRegex(textFlat, fields);
+            NormalizePassportDocumentNumber(fields);
+            return fields;
         }
 
+        NormalizePassportDocumentNumber(fields);
         return fields;
     }
 
-    private void ExtractPassportVisibleFields(string text, Dictionary<string, ExtractedFieldDto> fields)
+    /// <summary>Strip OCR junk (e.g. %) and cap length to ICAO document number field (9 chars).</summary>
+    private static void NormalizePassportDocumentNumber(Dictionary<string, ExtractedFieldDto> fields)
+    {
+        if (!fields.TryGetValue("documentNumber", out var dn) || string.IsNullOrWhiteSpace(dn.Value))
+            return;
+
+        var original = dn.Value.Trim();
+        var v = System.Text.RegularExpressions.Regex.Replace(original, @"[^A-Za-z0-9]", "");
+        if (v.Length > 9 && System.Text.RegularExpressions.Regex.IsMatch(v, @"^[A-Z]{2}\d", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            v = v.Substring(0, 9);
+
+        v = v.ToUpperInvariant();
+        if (v.Length == 0)
+            return;
+
+        var same = string.Equals(v, original, StringComparison.OrdinalIgnoreCase)
+                   && !System.Text.RegularExpressions.Regex.IsMatch(original, @"[^A-Za-z0-9]");
+        if (same)
+            return;
+
+        fields["documentNumber"] = new ExtractedFieldDto
+        {
+            Value = v,
+            Confidence = dn.Confidence,
+            BoundingBox = dn.BoundingBox
+        };
+    }
+
+    /// <summary>Preserves newlines (needed for place of birth / issuing authority line layout).</summary>
+    private static string NormalizePassportOcrLines(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return text;
+
+        text = text.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        var sb = new StringBuilder();
+        foreach (var line in text.Split('\n'))
+        {
+            var t = System.Text.RegularExpressions.Regex.Replace(line.Trim(), @"\s+", " ");
+            if (t.Length == 0) continue;
+            if (sb.Length > 0) sb.Append('\n');
+            sb.Append(t);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Uses line breaks so place of birth and issuing authority are not merged (common OCR error on Nepali passports).
+    /// </summary>
+    private void ApplyPassportPlaceAndAuthorityFromLines(string textLines, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        if (string.IsNullOrWhiteSpace(textLines))
+            return;
+
+        if (System.Text.RegularExpressions.Regex.IsMatch(textLines, @"DEPARTMENT\s+OF\s+PASSPORTS", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+        {
+            var hasMofa = System.Text.RegularExpressions.Regex.IsMatch(textLines, @"\bMOFA\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            var nplFromMrz = fields.TryGetValue("nationality", out var nat)
+                             && string.Equals(nat.Value?.Trim(), "NPL", StringComparison.OrdinalIgnoreCase);
+            var value = hasMofa || nplFromMrz ? "MOFA, DEPARTMENT OF PASSPORTS" : "DEPARTMENT OF PASSPORTS";
+            var prev = fields.GetValueOrDefault("issuingAuthority");
+            fields["issuingAuthority"] = new ExtractedFieldDto
+            {
+                Value = value,
+                Confidence = Math.Max(0.88m, prev?.Confidence ?? 0m),
+                BoundingBox = prev?.BoundingBox ?? new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+
+        string? pobCity = null;
+        var pobAfterLabel = System.Text.RegularExpressions.Regex.Match(
+            textLines,
+            @"PLACE\s*OF\s*BIRTH[^\n]*\n\s*([A-Z]{3,40})\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (pobAfterLabel.Success)
+            pobCity = pobAfterLabel.Groups[1].Value.Trim();
+
+        if (string.IsNullOrEmpty(pobCity))
+        {
+            var pobInline = System.Text.RegularExpressions.Regex.Match(
+                textLines,
+                @"\b(?:HFREAT|PLACE\s*OF\s*BIRTH)\b[^\n]*\n\s*([A-Z]{4,30})\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (pobInline.Success)
+                pobCity = pobInline.Groups[1].Value.Trim();
+        }
+
+        if (string.IsNullOrEmpty(pobCity))
+        {
+            var pobBeforeDept = System.Text.RegularExpressions.Regex.Match(
+                textLines,
+                @"\b([A-Z]{4,30})\s+\d{3,4}\s+DEPARTMENT\s+OF\s+PASSPORTS\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (pobBeforeDept.Success)
+                pobCity = pobBeforeDept.Groups[1].Value.Trim();
+        }
+
+        if (!string.IsNullOrEmpty(pobCity)
+            && !pobCity.Contains("DEPARTMENT", StringComparison.OrdinalIgnoreCase)
+            && !pobCity.Contains("AUTHORITY", StringComparison.OrdinalIgnoreCase)
+            && !pobCity.Contains("ISSUING", StringComparison.OrdinalIgnoreCase))
+        {
+            var prevPob = fields.GetValueOrDefault("placeOfBirth");
+            fields["placeOfBirth"] = new ExtractedFieldDto
+            {
+                Value = pobCity,
+                Confidence = Math.Max(0.87m, prevPob?.Confidence ?? 0m),
+                BoundingBox = prevPob?.BoundingBox ?? new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+    }
+
+    /// <summary>When "DATE" OCRs as "OATE" and the issue date is on the line after the label.</summary>
+    private void ApplyPassportDateOfIssueFromLinesIfMissing(string textLines, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        if (fields.ContainsKey("dateOfIssue") || string.IsNullOrWhiteSpace(textLines))
+            return;
+
+        var m = System.Text.RegularExpressions.Regex.Match(
+            textLines,
+            @"(?:[DO]ATE|DATE)\s*OF\s*ISSUE[^\n]*\n\s*M\s+(\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4})",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!m.Success)
+            return;
+
+        var raw = m.Groups[1].Value.Trim();
+        if (!TryParsePassportVisibleDate(raw, out var dt))
+            return;
+
+        fields["dateOfIssue"] = new ExtractedFieldDto
+        {
+            Value = dt.ToString("yyyy-MM-dd"),
+            Confidence = 0.88m,
+            BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 },
+            Format = "yyyy-MM-dd"
+        };
+    }
+
+    private static bool TryParsePassportVisibleDate(string raw, out DateTime dt)
+    {
+        dt = default;
+        var formats = new[]
+        {
+            "dd MMM yyyy", "d MMM yyyy", "dd MMMM yyyy", "d MMMM yyyy",
+            "dd-MM-yyyy", "dd/MM/yyyy", "yyyy-MM-dd", "yyyy/MM/dd"
+        };
+        foreach (var f in formats)
+        {
+            if (DateTime.TryParseExact(raw, f, null, System.Globalization.DateTimeStyles.None, out dt))
+                return true;
+        }
+        return DateTime.TryParse(raw, out dt);
+    }
+
+    /// <summary>OCR often drops the SURNAME label; surname appears alone on the line before GIVEN NAMES.</summary>
+    private void ApplyPassportSurnameBeforeGivenNames(string textLines, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        if (string.IsNullOrWhiteSpace(textLines))
+            return;
+
+        var hasSurname = fields.TryGetValue("surname", out var s) && !string.IsNullOrWhiteSpace(s.Value) && s.Value.Trim().Length > 2;
+        if (hasSurname)
+            return;
+
+        // Line before "AT  GIVEN NAMES" is often surname-only (SURNAME label missing); allow trailing OCR noise (e.g. "0").
+        var m = System.Text.RegularExpressions.Regex.Match(
+            textLines,
+            @"\n\s*([A-Z]{3,40})\b[^\n]*\n\s*AT\s*GIVEN\s*NAMES",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!m.Success)
+            return;
+
+        var surname = m.Groups[1].Value.Trim();
+        if (surname.Length < 3 || surname.Contains(' ') && surname.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length > 3)
+            return;
+
+        fields["surname"] = new ExtractedFieldDto
+        {
+            Value = surname,
+            Confidence = 0.86m,
+            BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+        };
+
+        if (fields.TryGetValue("givenNames", out var gn) && !string.IsNullOrWhiteSpace(gn.Value))
+        {
+            fields["fullName"] = new ExtractedFieldDto
+            {
+                Value = $"{gn.Value.Trim()} {surname}".Trim(),
+                Confidence = Math.Max(0.86m, gn.Confidence),
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+    }
+
+    private void ExtractPassportVisibleFields(string textFlat, string textLines, Dictionary<string, ExtractedFieldDto> fields)
     {
         // Nepali passport patterns - look for both English and Nepali labels
         // More flexible patterns to handle OCR errors and various formats
@@ -1281,11 +1798,6 @@ public class OcrService : IOcrService
                 @"(?:GIVEN\s*NAMES|नाम|GIVEN\s*NAME)[:\s]*([A-Z\s]{2,30})"
             }, 0.85m),
             
-            ["fullName"] = (new[] {
-                @"(?:NAME|नाम|FULL\s*NAME)[:\s]*([A-Z\s,]{3,50})",
-                @"([A-Z]{2,}\s+[A-Z]{2,})" // Simple pattern: UPPERCASE UPPERCASE
-            }, 0.80m),
-            
             ["dateOfBirth"] = (new[] {
                 // Nepali passport format: "00 DEC 0000" or "00 DEC 2000"
                 @"(?:DATE\s*OF\s*BIRTH|जन्म\s*मिति|DOB|BIRTH\s*DATE)[:\s]*(\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4})",
@@ -1298,7 +1810,7 @@ public class OcrService : IOcrService
             }, 0.88m),
             
             ["placeOfBirth"] = (new[] {
-                @"(?:SFHEATT\s*)?(?:PLACE\s*OF\s*BIRTH|जन्मस्थान)[:\s]*([A-Z]{2,30})",
+                @"(?:SFHEATT\s*)?(?:PLACE\s*OF\s*BIRTH|जन्मस्थान|HFREAT)[:\s]*([A-Z]{2,30})",
                 @"PLACE\s*OF\s*BIRTH\s+([A-Z]{2,30})",
                 @"(?:PLACE\s*OF\s*BIRTH|जन्मस्थान)[:\s]*([A-Z\s]{2,30})"
             }, 0.85m),
@@ -1312,7 +1824,8 @@ public class OcrService : IOcrService
             }, 0.88m),
             
             ["dateOfIssue"] = (new[] {
-                // Nepali passport format: "00 DEC 0000"
+                // OCR often reads D as O: "OATE OF ISSUE"; sex line may merge as "M 28 MAR 2022"
+                @"(?:[DO]ATE|DATE)\s*OF\s*ISSUE\s+(?:M\s+)?(\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4})",
                 @"(?:DATE\s*AND\s*PLACE\s*OF\s*ISSUE|DATE\s*OF\s*ISSUE|जारी\s*मिति|ISSUE\s*DATE)[:\s]*(\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4})",
                 // Standard formats
                 @"(?:DATE\s*OF\s*ISSUE|जारी\s*मिति|ISSUE\s*DATE)[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
@@ -1345,7 +1858,7 @@ public class OcrService : IOcrService
 
             foreach (var pattern in kvp.Value.patterns)
             {
-                var match = System.Text.RegularExpressions.Regex.Match(text, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                var match = System.Text.RegularExpressions.Regex.Match(textFlat, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                 if (match.Success)
                 {
                     var value = match.Groups[1].Value.Trim();
@@ -1354,8 +1867,8 @@ public class OcrService : IOcrService
                     value = System.Text.RegularExpressions.Regex.Replace(value, @"\s+", " ");
                     value = value.Trim();
                     
-                    // Special handling for dates - try multiple formats
-                    if (kvp.Key.Contains("Date"))
+                    // Special handling for dates - try multiple formats (dateOfIssue is lowercase "date")
+                    if (kvp.Key.Contains("Date", StringComparison.OrdinalIgnoreCase))
                     {
                         // Try parsing various date formats (including Nepali passport format)
                         var dateFormats = new[] { 
@@ -1422,6 +1935,10 @@ public class OcrService : IOcrService
             }
         }
 
+        ApplyPassportPlaceAndAuthorityFromLines(textLines, fields);
+        ApplyPassportDateOfIssueFromLinesIfMissing(textLines, fields);
+        ApplyPassportSurnameBeforeGivenNames(textLines, fields);
+
         // Passport surname guard: OCR sometimes captures the tiny token after "SURNAME" (e.g., "BS")
         // and the actual surname is on the next line (e.g., "SHRESTHA"). Fix only in that case.
         if (fields.TryGetValue("surname", out var s) && !string.IsNullOrWhiteSpace(s.Value))
@@ -1429,17 +1946,16 @@ public class OcrService : IOcrService
             var sv = s.Value.Trim();
             if (sv.Length <= 2)
             {
-                // Note: text is normalized earlier, so newlines may be gone; handle both layouts.
                 var betterSurname = System.Text.RegularExpressions.Regex.Match(
-                    text,
+                    textFlat,
                     @"\bSURNAME\b\s+[A-Z0-9]{1,3}\s+([A-Z]{3,30})\b",
                     System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
                 if (!betterSurname.Success)
                 {
                     betterSurname = System.Text.RegularExpressions.Regex.Match(
-                        text,
-                        @"\bSURNAME\b\s+[A-Z0-9]{1,3}\s*\r?\n\s*([A-Z]{3,30})",
+                        textLines,
+                        @"\bSURNAME\b\s+[A-Z0-9]{1,3}\s*\n\s*([A-Z]{3,30})",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                 }
 
@@ -1607,69 +2123,516 @@ public class OcrService : IOcrService
     {
         var fields = new Dictionary<string, ExtractedFieldDto>();
 
-        // Nepalese National ID patterns
-        // NIN: 023-456-2130 or परिचय नम्वर
-        var ninPattern = @"(?:NIN|परिचय\s*नम्वर|NATIONAL\s*IDENTITY\s*NUMBER)[:\s]*(\d{3}[-/]\d{3}[-/]\d{4})";
-        var genericIdPattern = @"(?:ID|IDENTITY)\s*(?:NO|NUMBER|#)[:\s]*([A-Z0-9-]+)";
-        
-        // Surname: वर | SURNAME
-        var surnamePattern = @"(?:SURNAME|वर|थर)[:\s]*([A-Z\s]+)";
-        
-        // Given Name: बाम | GIVEN NAME
-        var givenNamePattern = @"(?:GIVEN\s*NAME|GIVEN\s*NAS|बाम|नाम)[:\s]*([A-Z\s]+)";
-        
-        // Date of Birth: 2034-10-23 or 1978-02-05
-        var dobPattern = @"(?:DATE\s*OF\s*BIRTH|जन्म\s*मिति|DOB)[:\s]*(\d{4}[-/]\d{1,2}[-/]\d{1,2})";
-        
-        // Mother's Name: आमाको नाम | MOTHER'S NAME
-        var motherNamePattern = @"(?:MOTHER['\s]*S\s*NAME|आमाको\s*नाम)[:\s]*([A-Z\s]+)";
-        
-        // Father's Name: बापकी गाम | FATHER'S NAME
-        var fatherNamePattern = @"(?:FATHER['\s]*S\s*NAME|बापकी|बाबुको\s*नाम)[:\s]*([A-Z\s]+)";
-        
-        // Date of Issue: 01-01-2017
-        var issueDatePattern = @"(?:DATE\s*OF\s*ISSUE|जारी\s*विति|जारी\s*मिति)[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{4})";
-        
-        // Nationality: Nepalese
-        var nationalityPattern = @"(?:NATIONALITY|राष्ट्रियता)[:\s]*(NEPALESE|NEPALI)";
-        
-        // Sex: F or M
-        var sexPattern = @"(?:SEX|लिङ्ग)[:\s]*([MF])";
+        if (string.IsNullOrWhiteSpace(text))
+            return fields;
 
-        // Try NIN pattern first (Nepali format)
-        ExtractFieldFromRegex(text, ninPattern, 1, "documentNumber", fields, 0.95m);
-        if (!fields.ContainsKey("documentNumber"))
+        // Keep line breaks for noisy OCR; single-line collapse destroys name / label structure.
+        text = NormalizeNepalNationalIdOcrText(text);
+        var flat = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ");
+
+        // NIN (National Identity Number): 023-456-2130 — label variants + OCR noise
+        var ninPatterns = new[]
         {
-            ExtractFieldFromRegex(text, genericIdPattern, 1, "documentNumber", fields, 0.90m);
+            @"(?:NIN|NATIONAL\s*IDENTITY\s*NUMBER|राष्ट्रिय\s*परिचय\s*नम्बर|परिचय\s*नम्बर|परिचय\s*नम्वर)[:\s|/\\-]*(\d{3}[-/]\d{3}[-/]\d{4})",
+            @"\b(\d{3}[-/]\d{3}[-/]\d{4})\b"
+        };
+
+        for (var pi = 0; pi < ninPatterns.Length; pi++)
+        {
+            var p = ninPatterns[pi];
+            var m = System.Text.RegularExpressions.Regex.Match(flat, p, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!m.Success) continue;
+            if (pi == 1 && !System.Text.RegularExpressions.Regex.IsMatch(flat,
+                    @"NATIONAL\s*IDENTITY|IDENTITY\s*CARD|GOVERNMENT\s*OF\s*NEPAL|NIN|परिचय|राष्ट्र", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                continue;
+
+            fields["documentNumber"] = new ExtractedFieldDto
+            {
+                Value = m.Groups[1].Value.Replace('/', '-'),
+                Confidence = 0.94m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+            fields["nationalIdentityNumber"] = new ExtractedFieldDto
+            {
+                Value = fields["documentNumber"].Value,
+                Confidence = 0.94m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+            break;
         }
-        
-        ExtractFieldFromRegex(text, surnamePattern, 1, "surname", fields, 0.85m);
-        ExtractFieldFromRegex(text, givenNamePattern, 1, "givenNames", fields, 0.85m);
-        ExtractFieldFromRegex(text, dobPattern, 1, "dateOfBirth", fields, 0.88m);
-        ExtractFieldFromRegex(text, motherNamePattern, 1, "motherName", fields, 0.85m);
-        ExtractFieldFromRegex(text, fatherNamePattern, 1, "fatherName", fields, 0.85m);
-        ExtractFieldFromRegex(text, issueDatePattern, 1, "dateOfIssue", fields, 0.85m);
-        ExtractFieldFromRegex(text, nationalityPattern, 1, "nationality", fields, 0.90m);
-        ExtractFieldFromRegex(text, sexPattern, 1, "sex", fields, 0.95m);
-        
-        // Build fullName from surname and givenNames
+
+        if (!fields.ContainsKey("documentNumber"))
+            TryExtractNepalNidNinFallback(flat, fields);
+
+        // Surname / given name (Latin); labels are bilingual on the physical card.
+        var surnamePattern = @"(?:SURNAME|थर)[:\s|/\\-]*([A-Z][A-Za-z]+(?:\s+[A-Z][a-z]+)*)";
+        var givenNamePattern = @"(?:GIVEN\s*NAME|नाम\s*\|\s*GIVEN|GIVEN\s*NAS)[:\s|/\\-]*([A-Z][A-Za-z]+(?:\s+[A-Z][a-z]+)*)";
+
+        ExtractFieldFromRegex(flat, surnamePattern, 1, "surname", fields, 0.86m);
+        ExtractFieldFromRegex(flat, givenNamePattern, 1, "givenNames", fields, 0.86m);
+
+        // Date of birth: Nepal NID lists BS then AD (e.g. 2034-10-23 and 1978-02-05)
+        var dobBlock = System.Text.RegularExpressions.Regex.Match(
+            flat,
+            @"(?:DATE\s*OF\s*BIRTH|जन्म\s*मिति|DOB|FoB)[:\s|/\\-]*([\s\S]{0,220}?)(?=(?:MOTHER|FATHER|MOTHERS|PATHIATS|आमाको|बाबुको|DATE\s*OF\s*ISSUE|जारी|NATIONALITY|SEX)|$)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        if (dobBlock.Success)
+        {
+            var segment = dobBlock.Groups[1].Value;
+            var dates = System.Text.RegularExpressions.Regex.Matches(segment, @"\b(\d{4})-(\d{2})-(\d{2})\b");
+            if (dates.Count >= 2)
+            {
+                var parsed = new List<(int year, string iso)>();
+                foreach (System.Text.RegularExpressions.Match d in dates)
+                {
+                    if (int.TryParse(d.Groups[1].Value, out var y) &&
+                        int.TryParse(d.Groups[2].Value, out var mo) &&
+                        int.TryParse(d.Groups[3].Value, out var day))
+                    {
+                        parsed.Add((y, $"{y:D4}-{mo:D2}-{day:D2}"));
+                    }
+                }
+
+                if (parsed.Count >= 2)
+                {
+                    parsed.Sort((a, b) => a.year.CompareTo(b.year));
+                    var ad = parsed[0];
+                    var bs = parsed[^1];
+
+                    fields["dateOfBirth"] = new ExtractedFieldDto
+                    {
+                        Value = ad.iso,
+                        Confidence = 0.90m,
+                        BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 },
+                        Format = "yyyy-MM-dd"
+                    };
+                    if (bs.year != ad.year)
+                    {
+                        fields["dateOfBirthBS"] = new ExtractedFieldDto
+                        {
+                            Value = bs.iso,
+                            Confidence = 0.88m,
+                            BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                        };
+                    }
+                }
+            }
+            else if (dates.Count == 1)
+            {
+                ExtractFieldFromRegex(segment, @"(\d{4}-\d{2}-\d{2})", 1, "dateOfBirth", fields, 0.85m);
+            }
+        }
+
+        if (!fields.ContainsKey("dateOfBirth"))
+            ExtractFieldFromRegex(flat, @"(?:DATE\s*OF\s*BIRTH|जन्म\s*मिति|DOB)[:\s]*(\d{4}-\d{2}-\d{2})", 1, "dateOfBirth", fields, 0.84m);
+
+        if (!fields.ContainsKey("dateOfBirth") || !fields.ContainsKey("dateOfBirthBS"))
+            TryExtractNepalNidIsoDatesFallback(flat, fields);
+
+        // Parent names: often Devanagari-only on the physical card (OCR garbles labels: MOTHERS, PATHIATS, …)
+        var devanagariName = @"[\u0900-\u097F][\u0900-\u097F\s]{2,120}";
+        var motherPattern = $@"(?:MOTHER['\u2019\s]*S\s*NAME|MOTHERS|आमाको\s*नाम)[:\s|/\\-\|]*({devanagariName})";
+        var fatherPattern = $@"(?:FATHER['\u2019\s]*S\s*NAME|FATHERS|PATHIATS|PATHINT|बाबुको\s*नाम|F/H\s*NAME)[:\s|/\\-\|]*({devanagariName})";
+
+        var mm = System.Text.RegularExpressions.Regex.Match(flat, motherPattern);
+        if (mm.Success)
+        {
+            fields["motherName"] = new ExtractedFieldDto
+            {
+                Value = mm.Groups[1].Value.Trim(),
+                Confidence = 0.82m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+
+        var fm = System.Text.RegularExpressions.Regex.Match(flat, fatherPattern);
+        if (fm.Success)
+        {
+            fields["fatherName"] = new ExtractedFieldDto
+            {
+                Value = fm.Groups[1].Value.Trim(),
+                Confidence = 0.82m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+
+        if (!fields.ContainsKey("motherName") || !fields.ContainsKey("fatherName"))
+            TryExtractNepalNidParentsFallback(text, fields);
+
+        ExtractFieldFromRegex(flat, @"(?:DATE\s*OF\s*ISSUE|जारी\s*मिति|जारी\s*विति)[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{4})", 1, "dateOfIssue", fields, 0.85m);
+        if (!fields.ContainsKey("dateOfIssue"))
+            TryExtractNepalNidIssueDateFallback(flat, fields);
+
+        var nat = System.Text.RegularExpressions.Regex.Match(flat, @"(?:NATIONALITY|राष्ट्रियता)[:\s]*([A-Za-z]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (nat.Success)
+        {
+            fields["nationality"] = new ExtractedFieldDto
+            {
+                Value = nat.Groups[1].Value.Trim(),
+                Confidence = 0.90m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+        if (!fields.ContainsKey("nationality") && flat.Contains("Nepalese", StringComparison.OrdinalIgnoreCase))
+        {
+            fields["nationality"] = new ExtractedFieldDto
+            {
+                Value = "Nepalese",
+                Confidence = 0.82m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+
+        var sexM = System.Text.RegularExpressions.Regex.Match(flat, @"(?:SEX|लिङ्ग|GENDER)[:\s]*(M|F|MALE|FEMALE)\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (sexM.Success)
+        {
+            var s = sexM.Groups[1].Value.ToUpperInvariant();
+            var label = s is "M" or "MALE" ? "Male" : s is "F" or "FEMALE" ? "Female" : sexM.Groups[1].Value;
+            fields["sex"] = new ExtractedFieldDto
+            {
+                Value = label,
+                Confidence = 0.93m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+        if (!fields.ContainsKey("sex"))
+        {
+            var nf = System.Text.RegularExpressions.Regex.Match(flat, @"\bNepalese\s+([MF])\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (nf.Success)
+            {
+                fields["sex"] = new ExtractedFieldDto
+                {
+                    Value = nf.Groups[1].Value.Equals("M", StringComparison.OrdinalIgnoreCase) ? "Male" : "Female",
+                    Confidence = 0.80m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+            }
+        }
+
+        if (!fields.ContainsKey("surname") || !fields.ContainsKey("givenNames"))
+            TryExtractNepalNidLatinNamesFromLines(text, fields);
+
         if (!fields.ContainsKey("fullName") && fields.ContainsKey("surname") && fields.ContainsKey("givenNames"))
         {
             fields["fullName"] = new ExtractedFieldDto
             {
-                Value = $"{fields["surname"].Value} {fields["givenNames"].Value}".Trim(),
-                Confidence = 0.85m,
+                Value = $"{fields["givenNames"].Value} {fields["surname"].Value}".Trim(),
+                Confidence = 0.86m,
                 BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
             };
         }
         else if (!fields.ContainsKey("fullName"))
         {
-            // Fallback to generic name pattern
-            var namePattern = @"(?:NAME|नाम)[:\s]*([A-Z\s]+)";
-            ExtractFieldFromRegex(text, namePattern, 1, "fullName", fields, 0.80m);
+            ExtractFieldFromRegex(flat, @"(?:GIVEN\s*NAME|FULL\s*NAME)[:\s]*([A-Za-z\s]+)", 1, "fullName", fields, 0.78m);
         }
 
-        return fields.Count > 0 ? fields : ParseGenericFields(text);
+        RefineNepalNidParentNamesFromLines(text, fields);
+        if (fields.TryGetValue("motherName", out var mn))
+        {
+            var cleaned = SanitizeNepalNidDevanagariName(mn.Value);
+            if (!string.IsNullOrWhiteSpace(cleaned))
+                fields["motherName"] = new ExtractedFieldDto { Value = cleaned, Confidence = mn.Confidence, BoundingBox = mn.BoundingBox };
+        }
+        if (fields.TryGetValue("fatherName", out var fn))
+        {
+            var cleanedF = SanitizeNepalNidDevanagariName(fn.Value);
+            if (!string.IsNullOrWhiteSpace(cleanedF))
+                fields["fatherName"] = new ExtractedFieldDto { Value = cleanedF, Confidence = fn.Confidence, BoundingBox = fn.BoundingBox };
+        }
+
+        return fields.Count > 0 ? fields : ParseGenericFields(flat);
+    }
+
+    /// <summary>
+    /// Prefer a clean Devanagari-only line after MOTHERS/FATHER labels (avoids digit noise and merged next-line garbage).
+    /// </summary>
+    private static void RefineNepalNidParentNamesFromLines(string textWithLines, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        var lines = textWithLines
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.Trim())
+            .Where(l => l.Length > 0)
+            .ToList();
+
+        var motherPlaced = false;
+        var fatherPlaced = false;
+
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var L = lines[i];
+            if (!motherPlaced &&
+                System.Text.RegularExpressions.Regex.IsMatch(L,
+                    @"MOTHERS|आमाको\s*नाम|MOTHER'?S\s*NAME",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                for (var j = i + 1; j < lines.Count && j <= i + 5; j++)
+                {
+                    var c = lines[j];
+                    var score = NepalNidPureDevanagariNameLineScore(c);
+                    if (score >= 3)
+                    {
+                        fields["motherName"] = new ExtractedFieldDto
+                        {
+                            Value = SanitizeNepalNidDevanagariName(c),
+                            Confidence = 0.88m,
+                            BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                        };
+                        motherPlaced = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!fatherPlaced &&
+                System.Text.RegularExpressions.Regex.IsMatch(L,
+                    @"FATHERS|बाबुको\s*नाम|FATHER'?S\s*NAME|फणा\s*चाड\s*\|\s*FATHER|PATHINT|\|\s*FATHER",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                for (var j = i + 1; j < lines.Count && j <= i + 5; j++)
+                {
+                    var c = lines[j];
+                    if (!NepalNidFatherNameLineLooksPlausible(c)) continue;
+                    fields["fatherName"] = new ExtractedFieldDto
+                    {
+                        Value = SanitizeNepalNidDevanagariName(c),
+                        Confidence = 0.85m,
+                        BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                    };
+                    fatherPlaced = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    private static int NepalNidPureDevanagariNameLineScore(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return 0;
+        if (System.Text.RegularExpressions.Regex.IsMatch(line, @"[\u0966-\u096F]")) return 0;
+        if (System.Text.RegularExpressions.Regex.IsMatch(line, @"\d")) return 0;
+        if (!System.Text.RegularExpressions.Regex.IsMatch(line, @"^[\u0900-\u097F\s]+$")) return 0;
+        return line.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+    }
+
+    private static bool NepalNidFatherNameLineLooksPlausible(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line) || line.Length < 4) return false;
+        if (line.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length is < 2 or > 14) return false;
+        var hasDev = System.Text.RegularExpressions.Regex.IsMatch(line, @"[\u0900-\u097F]{2,}");
+        var hasLatin = System.Text.RegularExpressions.Regex.IsMatch(line, @"[A-Za-z]");
+        // e.g. "B प्रसाद पोख्रेल" or full Devanagari
+        return hasDev || (hasLatin && System.Text.RegularExpressions.Regex.IsMatch(line, @"[\u0900-\u097F]"));
+    }
+
+    /// <summary>Strip leading Nepali digit noise and trailing label fragments merged by OCR.</summary>
+    private static string SanitizeNepalNidDevanagariName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return value ?? string.Empty;
+
+        var s = value.Trim();
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"^[\s\u0966-\u096F\u200c|]+", "");
+        foreach (var marker in new[] { " फणा चाड", "फणा चाड", " फणा", "फणा", " चाड", "PATHINT", "PATHIATS", "P2" })
+        {
+            var i = s.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (i > 0)
+                s = s.Substring(0, i).TrimEnd();
+        }
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\s+", " ");
+        return s.Trim();
+    }
+
+    /// <summary>Preserves line breaks, fixes common NID OCR typos, normalizes spaces per line.</summary>
+    private static string NormalizeNepalNationalIdOcrText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return text;
+
+        text = text.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        var lines = text.Split('\n');
+        var sb = new StringBuilder();
+        foreach (var line in lines)
+        {
+            var t = System.Text.RegularExpressions.Regex.Replace(line.Trim(), @"\s+", " ");
+            if (t.Length == 0) continue;
+            if (sb.Length > 0) sb.Append('\n');
+            sb.Append(t);
+        }
+
+        var s = sb.ToString();
+        s = s.Replace("GOYERNMENT", "GOVERNMENT", StringComparison.OrdinalIgnoreCase);
+        s = s.Replace("PATHIATS", "FATHER", StringComparison.OrdinalIgnoreCase);
+        s = s.Replace("PATHINT", "FATHER", StringComparison.OrdinalIgnoreCase);
+        s = s.Replace("राष्ट्रय परिचय", "राष्ट्रिय परिचय", StringComparison.Ordinal);
+        return s;
+    }
+
+    private static void TryExtractNepalNidNinFallback(string flat, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        var rx = new System.Text.RegularExpressions.Regex(@"\b(\d{3}-\d{3}-\d{4})\b");
+        var counts = new Dictionary<string, int>();
+        foreach (System.Text.RegularExpressions.Match m in rx.Matches(flat))
+        {
+            var v = m.Groups[1].Value;
+            if (v.StartsWith("000", StringComparison.Ordinal)) continue;
+            counts[v] = counts.GetValueOrDefault(v) + 1;
+        }
+
+        if (counts.Count == 0) return;
+        var best = counts.OrderByDescending(kv => kv.Value).First().Key;
+        fields["documentNumber"] = new ExtractedFieldDto
+        {
+            Value = best,
+            Confidence = 0.78m,
+            BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+        };
+        fields["nationalIdentityNumber"] = new ExtractedFieldDto
+        {
+            Value = best,
+            Confidence = 0.78m,
+            BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+        };
+    }
+
+    private static void TryExtractNepalNidIsoDatesFallback(string flat, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        var rx = new System.Text.RegularExpressions.Regex(@"\b(\d{4})-(\d{2})-(\d{2})\b");
+        var years = new List<(int y, string iso)>();
+        foreach (System.Text.RegularExpressions.Match m in rx.Matches(flat))
+        {
+            if (!int.TryParse(m.Groups[1].Value, out var y)) continue;
+            if (!int.TryParse(m.Groups[2].Value, out var mo)) continue;
+            if (!int.TryParse(m.Groups[3].Value, out var d)) continue;
+            if (mo is < 1 or > 12 || d is < 1 or > 31) continue;
+            years.Add((y, $"{y:D4}-{mo:D2}-{d:D2}"));
+        }
+
+        if (years.Count == 0) return;
+
+        // AD birth years (Gregorian) vs BS calendar years on Nepali NID (often 2000+ for BS).
+        var adCandidates = years.Where(t => t.y is >= 1930 and <= 2015).OrderBy(t => t.y).ToList();
+        var bsCandidates = years.Where(t => t.y is >= 1990 and <= 2120).OrderByDescending(t => t.y).ToList();
+
+        if (!fields.ContainsKey("dateOfBirth") && adCandidates.Count > 0)
+        {
+            var ad = adCandidates[0];
+            fields["dateOfBirth"] = new ExtractedFieldDto
+            {
+                Value = ad.iso,
+                Confidence = 0.78m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 },
+                Format = "yyyy-MM-dd"
+            };
+        }
+
+        if (!fields.ContainsKey("dateOfBirthBS") && bsCandidates.Count > 0)
+        {
+            var bs = bsCandidates[0];
+            if (!fields.TryGetValue("dateOfBirth", out var dob) || !string.Equals(dob.Value, bs.iso, StringComparison.Ordinal))
+            {
+                fields["dateOfBirthBS"] = new ExtractedFieldDto
+                {
+                    Value = bs.iso,
+                    Confidence = 0.76m,
+                    BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+                };
+            }
+        }
+    }
+
+    private static void TryExtractNepalNidIssueDateFallback(string flat, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        var rx = new System.Text.RegularExpressions.Regex(@"\b(\d{2})-(\d{2})-(\d{4})\b");
+        foreach (System.Text.RegularExpressions.Match m in rx.Matches(flat))
+        {
+            if (!int.TryParse(m.Groups[3].Value, out var y) || y is < 1995 or > 2035) continue;
+            if (!int.TryParse(m.Groups[1].Value, out var d) || d is < 1 or > 31) continue;
+            if (!int.TryParse(m.Groups[2].Value, out var mo) || mo is < 1 or > 12) continue;
+            fields["dateOfIssue"] = new ExtractedFieldDto
+            {
+                Value = $"{m.Groups[1].Value}-{m.Groups[2].Value}-{m.Groups[3].Value}",
+                Confidence = 0.74m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+            return;
+        }
+    }
+
+    private static void TryExtractNepalNidParentsFallback(string textWithLines, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        var flat = System.Text.RegularExpressions.Regex.Replace(textWithLines, @"\s+", " ");
+        var devBlock = new System.Text.RegularExpressions.Regex(
+            @"(?:MOTHER'?S?\s*NAME|MOTHERS|आमाको\s*नाम)[^।\n]{0,40}?([\u0900-\u097F][\u0900-\u097F\s]{4,80}?)(?=(?:FATHER|PATHIATS|FATHERS|बाबु|पिता|NATIONALITY|SEX|$))",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        var dm = devBlock.Match(flat);
+        if (dm.Success && !fields.ContainsKey("motherName"))
+        {
+            fields["motherName"] = new ExtractedFieldDto
+            {
+                Value = dm.Groups[1].Value.Trim(),
+                Confidence = 0.72m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+
+        var df = new System.Text.RegularExpressions.Regex(
+            @"(?:FATHER'?S?\s*NAME|FATHERS|PATHIATS|PATHINT|बाबुको\s*नाम)[^।\n]{0,40}?([\u0900-\u097F][\u0900-\u097F\s]{4,80}?)(?=(?:DATE\s*OF\s*ISSUE|जारी|NATIONALITY|SEX|Nepalese|$))",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var dff = df.Match(flat);
+        if (dff.Success && !fields.ContainsKey("fatherName"))
+        {
+            fields["fatherName"] = new ExtractedFieldDto
+            {
+                Value = dff.Groups[1].Value.Trim(),
+                Confidence = 0.72m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+    }
+
+    private static void TryExtractNepalNidLatinNamesFromLines(string textWithLines, Dictionary<string, ExtractedFieldDto> fields)
+    {
+        static bool IsNoiseWord(string w)
+        {
+            var u = w.ToUpperInvariant();
+            return u is "NEPALESE" or "NATIONAL" or "IDENTITY" or "CARD" or "GOVERNMENT" or "NEPAL" or "MALE" or "FEMALE"
+                or "MOTHERS" or "MOTHER" or "FATHER" or "PATHIATS" or "DATE" or "BIRTH" or "NIN" or "NA";
+        }
+
+        var nameLine = new System.Text.RegularExpressions.Regex(@"^[A-Za-z]+(?:\s+[A-Za-z]+){1,3}$");
+        var candidates = new List<string>();
+        foreach (var line in textWithLines.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var t = line.Trim();
+            if (t.Length < 6 || !nameLine.IsMatch(t)) continue;
+            var parts = t.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Any(IsNoiseWord)) continue;
+            candidates.Add(t);
+        }
+
+        if (candidates.Count < 2) return;
+
+        // First plausible block after header noise: surname line then given-name line (as on sample NID).
+        if (!fields.ContainsKey("surname"))
+        {
+            fields["surname"] = new ExtractedFieldDto
+            {
+                Value = candidates[0],
+                Confidence = 0.72m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
+        if (!fields.ContainsKey("givenNames"))
+        {
+            fields["givenNames"] = new ExtractedFieldDto
+            {
+                Value = candidates[1],
+                Confidence = 0.72m,
+                BoundingBox = new BoundingBoxDto { X = 0, Y = 0, Width = 100, Height = 20 }
+            };
+        }
     }
 
     private Dictionary<string, ExtractedFieldDto> ParseCitizenshipCardFields(string text)

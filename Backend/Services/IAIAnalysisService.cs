@@ -12,6 +12,6 @@ public interface IAIAnalysisService
     Task<int> CalculateFieldCompletenessScore(Dictionary<string, ExtractedFieldDto> fields, string documentType);
     Task<int> CalculateFormatConsistencyScore(Dictionary<string, ExtractedFieldDto> fields, string documentType);
     Task<int> CalculateImageQualityScore(string imagePath);
-    Task<int> CalculateSecurityFeaturesScore(string imagePath);
+    Task<int> CalculateSecurityFeaturesScore(string imagePath, Dictionary<string, ExtractedFieldDto>? extractedFields = null, string? documentType = null);
     Task<int> CalculateMetadataConsistencyScore(string imagePath);
 }
