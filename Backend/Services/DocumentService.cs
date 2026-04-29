@@ -477,6 +477,10 @@ public class DocumentService : IDocumentService
             Priority = verification.Priority,
             FinalDecision = verification.FinalDecision,
             DecisionReason = verification.DecisionReason,
+            IsAutomaticallyApproved =
+                string.Equals(verification.FinalDecision, "Approved", StringComparison.OrdinalIgnoreCase) &&
+                !string.IsNullOrWhiteSpace(verification.DecisionReason) &&
+                verification.DecisionReason.Contains("automated verification checks", StringComparison.OrdinalIgnoreCase),
             ErrorMessage = verification.ErrorMessage,
             UserActionRequired = verification.UserActionRequired,
             ProcessingStartedAt = verification.ProcessingStartedAt,

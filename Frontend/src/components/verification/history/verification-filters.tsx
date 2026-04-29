@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { VerificationStatus, DocumentType, Priority } from '@/types/shared';
 
 interface VerificationFiltersProps {
+  filters: VerificationFilters;
   onFiltersChange: (filters: VerificationFilters) => void;
   onReset: () => void;
 }
@@ -18,6 +19,14 @@ export interface VerificationFilters {
     endDate: string;
   } | null;
 }
+
+export const INITIAL_VERIFICATION_FILTERS: VerificationFilters = {
+  searchTerm: '',
+  status: [],
+  documentType: [],
+  priority: [],
+  dateRange: null,
+};
 
 const statusOptions: { value: VerificationStatus; label: string }[] = [
   { value: 'Pending', label: 'Pending' },
@@ -41,21 +50,26 @@ const priorityOptions: { value: Priority; label: string }[] = [
   { value: 'Urgent', label: 'Urgent' },
 ];
 
-export default function VerificationFilters({ onFiltersChange, onReset }: VerificationFiltersProps) {
-  const [filters, setFilters] = useState<VerificationFilters>({
-    searchTerm: '',
-    status: [],
-    documentType: [],
-    priority: [],
-    dateRange: null,
-  });
-
+export default function VerificationFilters({ filters, onFiltersChange, onReset }: VerificationFiltersProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const updateFilters = (updates: Partial<VerificationFilters>) => {
     const newFilters = { ...filters, ...updates };
-    setFilters(newFilters);
     onFiltersChange(newFilters);
+  };
+
+  const updateDateRange = (startDate: string, endDate: string) => {
+    if (!startDate && !endDate) {
+      updateFilters({ dateRange: null });
+      return;
+    }
+
+    updateFilters({
+      dateRange: {
+        startDate,
+        endDate,
+      },
+    });
   };
 
   const handleStatusToggle = (status: VerificationStatus) => {
@@ -79,11 +93,11 @@ export default function VerificationFilters({ onFiltersChange, onReset }: Verifi
     updateFilters({ priority: newPriorities });
   };
 
-  const hasActiveFilters = filters.searchTerm ||
+  const hasActiveFilters = Boolean(filters.searchTerm) ||
     filters.status.length > 0 ||
     filters.documentType.length > 0 ||
     filters.priority.length > 0 ||
-    filters.dateRange;
+    Boolean(filters.dateRange?.startDate || filters.dateRange?.endDate);
 
   return (
     <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6">
@@ -201,14 +215,7 @@ export default function VerificationFilters({ onFiltersChange, onReset }: Verifi
                     type="date"
                     className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm text-gray-900 bg-white focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
                     value={filters.dateRange?.startDate || ''}
-                    onChange={(e) =>
-                      updateFilters({
-                        dateRange: {
-                          startDate: e.target.value,
-                          endDate: filters.dateRange?.endDate || '',
-                        },
-                      })
-                    }
+                    onChange={(e) => updateDateRange(e.target.value, filters.dateRange?.endDate || '')}
                   />
                 </div>
                 <div>
@@ -218,14 +225,7 @@ export default function VerificationFilters({ onFiltersChange, onReset }: Verifi
                     type="date"
                     className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm text-gray-900 bg-white focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
                     value={filters.dateRange?.endDate || ''}
-                    onChange={(e) =>
-                      updateFilters({
-                        dateRange: {
-                          startDate: filters.dateRange?.startDate || '',
-                          endDate: e.target.value,
-                        },
-                      })
-                    }
+                    onChange={(e) => updateDateRange(filters.dateRange?.startDate || '', e.target.value)}
                   />
                 </div>
               </div>

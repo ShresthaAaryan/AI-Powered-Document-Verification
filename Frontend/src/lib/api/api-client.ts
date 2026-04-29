@@ -13,7 +13,7 @@ class ApiClient {
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
-    const url = `${this.baseUrl}${endpoint}`;
+    const url = endpoint.startsWith('http') ? endpoint : `${this.baseUrl}${endpoint}`;
 
     // Get auth headers
     const authHeaders = authService.getAuthHeader();
@@ -64,7 +64,7 @@ class ApiClient {
       });
     }
 
-    return this.request<T>(endpoint, {
+    return this.request<T>(url.toString(), {
       method: 'GET',
     });
   }

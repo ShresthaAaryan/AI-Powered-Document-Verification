@@ -9,6 +9,7 @@ public class VerificationDto
     public string Priority { get; set; } = string.Empty;
     public string? FinalDecision { get; set; }
     public string? DecisionReason { get; set; }
+    public bool IsAutomaticallyApproved { get; set; }
     public string? ErrorMessage { get; set; }
     public string? UserActionRequired { get; set; }
     public DateTime? ProcessingStartedAt { get; set; }

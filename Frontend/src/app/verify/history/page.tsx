@@ -1,43 +1,40 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import DashboardLayout from '@/components/layout/dashboard-layout';
 import VerificationTable from '@/components/verification/history/verification-table';
 import VerificationFiltersComponent from '@/components/verification/history/verification-filters';
-import type { VerificationFilters } from '@/components/verification/history/verification-filters';
-import { VerificationDto, VerificationListRequest } from '@/types/shared';
+import {
+  INITIAL_VERIFICATION_FILTERS,
+  type VerificationFilters
+} from '@/components/verification/history/verification-filters';
+import { VerificationDto } from '@/types/shared';
 import { verificationService } from '@/lib/api/verification-service';
 
 export default function VerificationHistoryPage() {
   const router = useRouter();
-  const [verifications, setVerifications] = useState<VerificationDto[]>([]);
+  const [allVerifications, setAllVerifications] = useState<VerificationDto[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [deletingVerificationIds, setDeletingVerificationIds] = useState<string[]>([]);
+  const [filters, setFilters] = useState<VerificationFilters>(INITIAL_VERIFICATION_FILTERS);
   const [pagination, setPagination] = useState({
     page: 1,
     pageSize: 20,
     totalCount: 0,
   });
 
-  const loadVerifications = async (request: VerificationListRequest = {}) => {
+  const loadVerifications = async () => {
     try {
       setIsLoading(true);
-      const response = await verificationService.getMyVerifications({
-        ...request,
-        page: pagination.page,
-        pageSize: pagination.pageSize,
-      });
-
-      setVerifications(response.verifications);
-      setPagination(prev => ({
-        ...prev,
-        totalCount: response.totalCount,
-      }));
+      const response = await verificationService.getMyVerifications({ page: 1, pageSize: 1000 });
+      setAllVerifications(response.verifications);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load verifications');
-      setVerifications([]);
+      setAllVerifications([]);
     } finally {
       setIsLoading(false);
     }
@@ -47,48 +44,108 @@ export default function VerificationHistoryPage() {
     loadVerifications();
   }, []);
 
-  const handleFiltersChange = (filters: VerificationFilters) => {
-    const request: VerificationListRequest = {
-      page: 1, // Reset to first page when filters change
-      pageSize: pagination.pageSize,
-      searchTerm: filters.searchTerm,
-      status: filters.status.length > 0 ? filters.status[0] as any : undefined,
-      documentType: filters.documentType.length > 0 ? filters.documentType[0] as any : undefined,
-      priority: filters.priority.length > 0 ? filters.priority[0] as any : undefined,
-      startDate: filters.dateRange?.startDate,
-      endDate: filters.dateRange?.endDate,
-    };
+  const filteredVerifications = useMemo(() => {
+    return allVerifications.filter((verification) => {
+      const searchTerm = filters.searchTerm.trim().toLowerCase();
+      const matchesSearch =
+        !searchTerm ||
+        verification.referenceNumber.toLowerCase().includes(searchTerm) ||
+        (verification.submittedBy || '').toLowerCase().includes(searchTerm) ||
+        (verification.assignedTo || '').toLowerCase().includes(searchTerm);
 
+      const matchesStatus =
+        filters.status.length === 0 || filters.status.includes(verification.status);
+      const matchesDocumentType =
+        filters.documentType.length === 0 || filters.documentType.includes(verification.documentType);
+      const matchesPriority =
+        filters.priority.length === 0 || filters.priority.includes(verification.priority);
+
+      const createdAt = new Date(verification.createdAt);
+      const startDate = filters.dateRange?.startDate ? new Date(filters.dateRange.startDate) : null;
+      const endDate = filters.dateRange?.endDate ? new Date(filters.dateRange.endDate) : null;
+
+      if (endDate) {
+        endDate.setHours(23, 59, 59, 999);
+      }
+
+      const matchesStartDate = !startDate || createdAt >= startDate;
+      const matchesEndDate = !endDate || createdAt <= endDate;
+
+      return (
+        matchesSearch &&
+        matchesStatus &&
+        matchesDocumentType &&
+        matchesPriority &&
+        matchesStartDate &&
+        matchesEndDate
+      );
+    });
+  }, [allVerifications, filters]);
+
+  useEffect(() => {
+    setPagination((prev) => ({ ...prev, totalCount: filteredVerifications.length }));
+  }, [filteredVerifications.length]);
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(filteredVerifications.length / pagination.pageSize));
+    if (pagination.page > maxPage) {
+      setPagination((prev) => ({ ...prev, page: maxPage }));
+    }
+  }, [filteredVerifications.length, pagination.page, pagination.pageSize]);
+
+  const verifications = useMemo(() => {
+    const startIndex = (pagination.page - 1) * pagination.pageSize;
+    return filteredVerifications.slice(startIndex, startIndex + pagination.pageSize);
+  }, [filteredVerifications, pagination.page, pagination.pageSize]);
+
+  const handleFiltersChange = (filters: VerificationFilters) => {
+    setFilters(filters);
     setPagination(prev => ({ ...prev, page: 1 }));
-    loadVerifications(request);
   };
 
   const handleReset = () => {
+    setFilters(INITIAL_VERIFICATION_FILTERS);
     setPagination(prev => ({ ...prev, page: 1 }));
-    loadVerifications();
   };
 
   const handleViewDetails = (id: string) => {
     router.push(`/verify/${id}/status`);
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('Are you sure you want to delete this verification? This action cannot be undone.')) {
+  const handleDelete = async (verificationToDelete: VerificationDto) => {
+    const { id, referenceNumber } = verificationToDelete;
+    const shouldDelete = confirm(
+      `Delete verification "${referenceNumber}"?\n\nThis action cannot be undone.`
+    );
+    if (!shouldDelete) {
       return;
     }
 
+    const previousVerifications = allVerifications;
+    setNotice(null);
+    setDeletingVerificationIds((prev) => [...prev, id]);
+    setAllVerifications((prev) => prev.filter((verification) => verification.id !== id));
+
     try {
       await verificationService.deleteVerification(id);
-      // Reload verifications after deletion
       await loadVerifications();
+      setNotice({
+        type: 'success',
+        message: `Verification ${referenceNumber} deleted successfully.`,
+      });
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to delete verification');
+      setAllVerifications(previousVerifications);
+      setNotice({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Failed to delete verification',
+      });
+    } finally {
+      setDeletingVerificationIds((prev) => prev.filter((verificationId) => verificationId !== id));
     }
   };
 
   const handlePageChange = (newPage: number) => {
     setPagination(prev => ({ ...prev, page: newPage }));
-    loadVerifications({ page: newPage });
   };
 
   const totalPages = Math.ceil(pagination.totalCount / pagination.pageSize);
@@ -118,6 +175,7 @@ export default function VerificationHistoryPage() {
 
         {/* Filters */}
         <VerificationFiltersComponent
+          filters={filters}
           onFiltersChange={handleFiltersChange}
           onReset={handleReset}
         />
@@ -128,6 +186,26 @@ export default function VerificationHistoryPage() {
             <div className="text-sm text-red-600">{error}</div>
           </div>
         )}
+        {notice && (
+          <div
+            className={`mb-6 border rounded-md p-4 ${
+              notice.type === 'success'
+                ? 'bg-green-50 border-green-200 text-green-700'
+                : 'bg-red-50 border-red-200 text-red-600'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sm">{notice.message}</span>
+              <button
+                type="button"
+                onClick={() => setNotice(null)}
+                className="text-xs font-medium hover:opacity-80"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Table */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200">
@@ -135,6 +213,7 @@ export default function VerificationHistoryPage() {
             verifications={verifications}
             onViewDetails={handleViewDetails}
             onDelete={handleDelete}
+            deletingVerificationIds={deletingVerificationIds}
           />
         </div>
 

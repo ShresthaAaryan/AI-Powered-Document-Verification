@@ -341,74 +341,26 @@ public class WorkflowService : IWorkflowService
         OcrResult? ocrResult,
         string documentType)
     {
-        var scores = new Dictionary<string, int>();
+        // Primary automatic approval gate:
+        // approve only when both authenticity and face-match are strong.
+        var authenticity = authenticityScore?.OverallScore ?? 0;
+        var faceMatchDecision = faceMatchResult?.MatchDecision;
+        var faceSimilarity = faceMatchResult?.SimilarityScore ?? 0m;
 
-        // Authenticity score weighting (40%)
-        if (authenticityScore != null)
+        // Strong positive signal from both engines -> auto approve.
+        if (authenticity >= 80 && faceMatchDecision == true && faceSimilarity >= 0.70m)
         {
-            scores["authenticity"] = authenticityScore.OverallScore;
-        }
-        else
-        {
-            scores["authenticity"] = 0;
-        }
-
-        // Face match weighting (30%)
-        if (faceMatchResult?.MatchDecision == true)
-        {
-            var similarity = faceMatchResult.SimilarityScore ?? 0m;
-            scores["faceMatch"] = (int)(similarity * 100);
-        }
-        else if (faceMatchResult?.MatchDecision == false)
-        {
-            scores["faceMatch"] = 20; // Low score for no match
-        }
-        else
-        {
-            scores["faceMatch"] = 50; // Medium score for inconclusive
+            return "Approved";
         }
 
-        // OCR quality weighting (30%)
-        if (ocrResult != null && ocrResult.ConfidenceScore.HasValue)
+        // Strong negative signal from either engine -> reject.
+        if (authenticity < 50 || faceMatchDecision == false)
         {
-            scores["ocr"] = (int)(ocrResult.ConfidenceScore.Value * 100);
-        }
-        else
-        {
-            scores["ocr"] = 0;
+            return "Rejected";
         }
 
-        // Document type consistency - ensure uploaded document matches selected type
-        var inferredType = InferDocumentTypeFromText(ocrResult?.RawText ?? string.Empty);
-        var docTypeScore = 100;
-        if (!string.IsNullOrWhiteSpace(inferredType))
-        {
-            if (!string.Equals(inferredType, documentType, StringComparison.OrdinalIgnoreCase))
-            {
-                // Strong penalty if OCR text clearly looks like a different document type
-                docTypeScore = 20;
-                _logger.LogInformation("Document type mismatch detected. Expected: {Expected}, Inferred: {Inferred}",
-                    documentType, inferredType);
-            }
-        }
-        else
-        {
-            // Neutral if we couldn't infer type reliably
-            docTypeScore = 70;
-        }
-
-        // Calculate weighted average (including document-type consistency)
-        var finalScore = (scores["authenticity"] * 0.35) +
-                         (scores["faceMatch"] * 0.25) +
-                         (scores["ocr"] * 0.25) +
-                         (docTypeScore * 0.15);
-
-        return finalScore switch
-        {
-            >= 80 => "Approved",
-            >= 60 => "ReviewNeeded",
-            _ => "Rejected"
-        };
+        // Borderline or incomplete evidence -> manual review.
+        return "ReviewNeeded";
     }
 
     private string GenerateDecisionReason(

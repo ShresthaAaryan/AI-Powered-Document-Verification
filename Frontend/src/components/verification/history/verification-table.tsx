@@ -7,10 +7,16 @@ import { verificationService } from '@/lib/api/verification-service';
 interface VerificationTableProps {
   verifications: VerificationDto[];
   onViewDetails: (id: string) => void;
-  onDelete?: (id: string) => void;
+  onDelete?: (verification: VerificationDto) => void;
+  deletingVerificationIds?: string[];
 }
 
-export default function VerificationTable({ verifications, onViewDetails, onDelete }: VerificationTableProps) {
+export default function VerificationTable({
+  verifications,
+  onViewDetails,
+  onDelete,
+  deletingVerificationIds = [],
+}: VerificationTableProps) {
   const [sortField, setSortField] = useState<keyof VerificationDto>('createdAt');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
 
@@ -205,27 +211,37 @@ export default function VerificationTable({ verifications, onViewDetails, onDele
                   )}
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                  {(() => {
+                    const isDeleting = deletingVerificationIds.includes(verification.id);
+                    return (
+                      <>
                   <button
                     onClick={() => onViewDetails(verification.id)}
-                    className="text-blue-600 hover:text-blue-900 mr-3"
+                    className="text-blue-600 hover:text-blue-900 mr-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={isDeleting}
                   >
                     View
                   </button>
                   <button
                     onClick={() => window.open(`/verify/${verification.id}/status`, '_blank')}
-                    className="text-gray-600 hover:text-gray-900 mr-3"
+                    className="text-gray-600 hover:text-gray-900 mr-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={isDeleting}
                   >
                     Status
                   </button>
                   {onDelete && (
                     <button
-                      onClick={() => onDelete(verification.id)}
-                      className="text-red-600 hover:text-red-900"
+                      onClick={() => onDelete(verification)}
+                      className="text-red-600 hover:text-red-900 disabled:opacity-50 disabled:cursor-not-allowed"
                       title="Delete verification"
+                      disabled={isDeleting}
                     >
-                      Delete
+                      {isDeleting ? 'Deleting...' : 'Delete'}
                     </button>
                   )}
+                      </>
+                    );
+                  })()}
                 </td>
               </tr>
             ))

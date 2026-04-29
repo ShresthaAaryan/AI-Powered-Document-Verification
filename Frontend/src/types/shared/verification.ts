@@ -18,6 +18,7 @@ export interface VerificationDto {
   priority: Priority;
   finalDecision?: FinalDecision;
   decisionReason?: string;
+  isAutomaticallyApproved?: boolean;
   errorMessage?: string;
   userActionRequired?: string;
   processingStartedAt?: string;
