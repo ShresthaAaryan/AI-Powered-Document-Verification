@@ -114,9 +114,6 @@ export default function ReviewQueue() {
                 <p className="text-sm font-medium text-gray-600">Needs Review</p>
                 <p className="text-2xl font-bold text-yellow-600">{getStatusCount('ReviewNeeded')}</p>
               </div>
-              <div className="bg-yellow-100 rounded-full p-3">
-                <span className="text-yellow-600 text-2xl">👁️</span>
-              </div>
             </div>
           </div>
 
@@ -125,9 +122,6 @@ export default function ReviewQueue() {
               <div>
                 <p className="text-sm font-medium text-gray-600">Processing</p>
                 <p className="text-2xl font-bold text-blue-600">{getStatusCount('Processing')}</p>
-              </div>
-              <div className="bg-blue-100 rounded-full p-3">
-                <span className="text-blue-600 text-2xl">⏳</span>
               </div>
             </div>
           </div>
@@ -138,9 +132,6 @@ export default function ReviewQueue() {
                 <p className="text-sm font-medium text-gray-600">Approved Today</p>
                 <p className="text-2xl font-bold text-green-600">{getStatusCount('Approved')}</p>
               </div>
-              <div className="bg-green-100 rounded-full p-3">
-                <span className="text-green-600 text-2xl">✓</span>
-              </div>
             </div>
           </div>
 
@@ -149,9 +140,6 @@ export default function ReviewQueue() {
               <div>
                 <p className="text-sm font-medium text-gray-600">Rejected Today</p>
                 <p className="text-2xl font-bold text-red-600">{getStatusCount('Rejected')}</p>
-              </div>
-              <div className="bg-red-100 rounded-full p-3">
-                <span className="text-red-600 text-2xl">✗</span>
               </div>
             </div>
           </div>

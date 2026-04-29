@@ -43,7 +43,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
     { name: 'Dashboard', href: '/dashboard', show: true },
     { name: 'New Verification', href: '/verify/new', show: true },
     { name: 'My Verifications', href: '/verify/history', show: true },
-    { name: 'Review Queue', href: '/review', show: authService.isVerificationOfficer() || authService.isAdmin() },
+    { name: 'Review Queue', href: '/review', show: true },
     { name: 'Administration', href: '/admin/settings', show: authService.isAdmin() },
   ].filter(item => item.show);
 
@@ -66,7 +66,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
             </button>
           </div>
           <div className="flex-1 h-0 pt-5 pb-4 overflow-y-auto">
-            <div className="flex-shrink-0 flex items-center px-4">
+            <div className="shrink-0 flex items-center px-4">
               <span className="text-xl font-bold text-blue-600">DocVerify</span>
             </div>
             <nav className="mt-5 px-2 space-y-1">
@@ -86,7 +86,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
 
       {/* Static sidebar for desktop */}
       <div className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 lg:border-r lg:border-gray-200 lg:bg-gray-50 lg:pt-5 lg:pb-4">
-        <div className="flex items-center flex-shrink-0 px-4">
+        <div className="flex items-center shrink-0 px-4">
           <span className="text-xl font-bold text-blue-600">DocVerify</span>
         </div>
         <nav className="mt-5 flex-1 px-2 space-y-1">

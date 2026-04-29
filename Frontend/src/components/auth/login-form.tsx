@@ -140,9 +140,9 @@ export default function LoginForm() {
 
           <div className="text-center">
             <p className="text-sm text-gray-600">
-              New to Document Verification?{' '}
-              <a href="#" className="font-medium text-blue-600 hover:text-blue-500">
-                Contact your administrator
+              Sign Up{' '}
+              <a href="signup" className="font-medium text-blue-600 hover:text-blue-500">
+                Create an account
               </a>
             </p>
           </div>
